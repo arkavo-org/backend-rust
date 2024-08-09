@@ -78,6 +78,7 @@ export PORT=8443
 export TLS_CERT_PATH=/path/to/fullchain.pem
 export TLS_KEY_PATH=/path/to/privkey.pem
 export KAS_KEY_PATH=/path/to/recipient_private_key.pem
+export NATS_URL=nats://localhost:4222
 export ENABLE_TIMING_LOGS=true
 export RUST_LOG=info
 ```
