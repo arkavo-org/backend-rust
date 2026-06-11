@@ -10,6 +10,7 @@ modern ZTDF rewrap (handled by platform).
 |----------|---------|---------|
 | `OPENTDF_PLATFORM_URL` | — | Upstream base URL, e.g. `https://platform.svc:8443`. |
 | `KAS_PROXY_MODE` | `off` | One of `off`, `connect`, `rest`, `both`. |
+| `AUTHZ_PROXY` | `off` | `on` forwards `/authorization.v2.AuthorizationService/*` to platform. Independent of `KAS_PROXY_MODE`; requires `OPENTDF_PLATFORM_URL`. |
 
 ## Modes
 
@@ -36,6 +37,15 @@ them through, you must either:
 1. Register `https://kas.arkavo.net` as platform's `RegisteredKASURI`, or
 2. Rewrite the `kas_url` field inside the signed rewrap request envelope — not
    currently supported; would require JWT re-signing with a key platform trusts.
+
+## Authorization service forwarding
+
+`AUTHZ_PROXY=on` exposes the platform's authorization.v2 decision endpoints
+through this host. PDP delegators — the entitled-catalog endpoint on
+iroh.arkavo.net (tdf-iroh-s3#5) — call
+`POST /authorization.v2.AuthorizationService/GetDecisionMultiResource` here
+with their service credentials; arks only relays, the platform's own authn
+governs access and all policy evaluation stays in the platform.
 
 ## What is NOT proxied
 

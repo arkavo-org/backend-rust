@@ -281,6 +281,46 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn forwards_authorization_v2_wildcard_routes() {
+        // The entitled-catalog endpoint (tdf-iroh-s3#5) reaches the platform
+        // PDP through this host; every AuthorizationService method must
+        // forward under the wildcard.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/authorization.v2.AuthorizationService/GetDecisionMultiResource",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"resourceDecisions":[]}"#, "application/json"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = PlatformProxyState::new(&upstream.uri()).expect("valid upstream URL");
+        let app = Router::new()
+            .route("/authorization.v2.AuthorizationService/*method", any(proxy))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = Client::new()
+            .post(format!(
+                "http://{addr}/authorization.v2.AuthorizationService/GetDecisionMultiResource"
+            ))
+            .header("content-type", "application/json")
+            .body(r#"{"entityIdentifier":{}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
     async fn forwards_post_with_body_and_returns_upstream_response() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
