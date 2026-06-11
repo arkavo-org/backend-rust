@@ -300,7 +300,12 @@ mod integration_tests {
 
         let state = PlatformProxyState::new(&upstream.uri()).expect("valid upstream URL");
         let app = Router::new()
-            .route("/authorization.v2.AuthorizationService/*method", any(proxy))
+            .route(
+                // post() mirrors the production binding in main.rs so the
+                // test catches accidental method-binding regressions.
+                "/authorization.v2.AuthorizationService/*method",
+                axum::routing::post(proxy),
+            )
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
