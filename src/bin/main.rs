@@ -705,20 +705,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let platform_proxy_state = match (env::var("OPENTDF_PLATFORM_URL").ok(), proxy_mode) {
-        (Some(url), mode) if mode != platform_proxy::ProxyMode::Off => {
+    // Authorization-service forwarding (AUTHZ_PROXY=on): exposes
+    // /authorization.v2.AuthorizationService/* from the upstream platform so
+    // PDP delegators (the entitled-catalog endpoint on iroh.arkavo.net,
+    // tdf-iroh-s3#5) can reach decisions through this host. Explicit opt-in,
+    // independent of KAS_PROXY_MODE.
+    let authz_proxy = matches!(
+        env::var("AUTHZ_PROXY").ok().as_deref(),
+        Some("on") | Some("true") | Some("1")
+    );
+
+    let needs_upstream = proxy_mode != platform_proxy::ProxyMode::Off || authz_proxy;
+    let platform_proxy_state = match (env::var("OPENTDF_PLATFORM_URL").ok(), needs_upstream) {
+        (Some(url), true) => {
             let state = platform_proxy::PlatformProxyState::new(&url)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             info!(
-                "Platform proxy enabled: mode={:?}, upstream={}",
-                mode, state.upstream_base
+                "Platform proxy enabled: mode={:?}, authz_proxy={}, upstream={}",
+                proxy_mode, authz_proxy, state.upstream_base
             );
             Some(state)
         }
-        (None, mode) if mode != platform_proxy::ProxyMode::Off => {
+        (None, true) => {
             return Err(format!(
-                "KAS_PROXY_MODE={:?} requires OPENTDF_PLATFORM_URL to be set",
-                mode
+                "KAS_PROXY_MODE={:?} / AUTHZ_PROXY={} requires OPENTDF_PLATFORM_URL to be set",
+                proxy_mode, authz_proxy
             )
             .into());
         }
@@ -906,6 +917,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
+    // Authorization service forwarding — decisions stay platform-evaluated;
+    // arks only relays. The platform's own authn governs access.
+    let authz_router = if authz_proxy {
+        let state = platform_proxy_state
+            .clone()
+            .expect("platform_proxy_state must exist when authz_proxy");
+        Router::new()
+            .route(
+                "/authorization.v2.AuthorizationService/*method",
+                post(platform_proxy::proxy),
+            )
+            .with_state(state)
+    } else {
+        Router::new()
+    };
+
     // Media DRM router
     let media_router = Router::new()
         .route("/media/v1/key-request", post(media_api::media_key_request))
@@ -956,6 +983,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(opentdf_router)
         .merge(wellknown_router)
         .merge(connect_router)
+        .merge(authz_router)
         .merge(media_router)
         .merge(c2pa_router)
         .layer(
