@@ -894,6 +894,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/.well-known/opentdf-configuration",
                 get(platform_proxy::proxy),
             )
+            // Public attribute discovery served from the upstream platform's
+            // policy snapshot (single source of truth). Attribute FQNs
+            // (https://<namespace>/attr/...) dereference through this host
+            // when the namespace DNS points here.
+            .route("/attributes", get(platform_proxy::proxy))
+            .route("/attr/*rest", get(platform_proxy::proxy))
             .with_state(state)
     } else {
         Router::new()

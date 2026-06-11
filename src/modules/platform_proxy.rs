@@ -281,6 +281,40 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn forwards_attribute_discovery_routes() {
+        // Attribute FQN paths must dereference through this host to the
+        // upstream platform's policy snapshot (single source of truth).
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attr/tier/value/supporter"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"value":"supporter","fqn":"https://patreon.arkavo.com/attr/tier/value/supporter"}"#,
+                "application/json",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = PlatformProxyState::new(&upstream.uri()).expect("valid upstream URL");
+        let app = Router::new()
+            .route("/attr/*rest", axum::routing::get(proxy))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = Client::new()
+            .get(format!("http://{addr}/attr/tier/value/supporter"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("supporter"));
+    }
+
+    #[tokio::test]
     async fn forwards_authorization_v2_wildcard_routes() {
         // The entitled-catalog endpoint (tdf-iroh-s3#5) reaches the platform
         // PDP through this host; every AuthorizationService method must
