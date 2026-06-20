@@ -996,6 +996,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tower::ServiceBuilder::new().layer(axum::middleware::from_fn(log_request_middleware)),
         );
 
+    // HTTP/3 (feature-gated). The H3 server serves the base `app`; the TCP `app`
+    // gets an Alt-Svc layer advertising h3 so HTTP/1.1/2 clients can upgrade.
+    // Alt-Svc is only meaningful to a TCP client, so the H3 path omits it.
+    #[cfg(feature = "http3")]
+    let h3_app_base = app.clone();
+
+    #[cfg(feature = "http3")]
+    let app = {
+        let alt_svc = modules::h3::alt_svc_header_value(settings.port);
+        app.layer(axum::middleware::map_response(
+            move |mut res: axum::response::Response| {
+                let alt_svc = alt_svc.clone();
+                async move {
+                    res.headers_mut()
+                        .insert(axum::http::header::ALT_SVC, alt_svc);
+                    res
+                }
+            },
+        ))
+    };
+
     // Start RTMP server if RTMP_PORT is configured
     if let Ok(rtmp_port_str) = env::var("RTMP_PORT") {
         let rtmp_port: u16 = rtmp_port_str.parse().unwrap_or(1935);
@@ -1038,6 +1059,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This avoids axum-server's synchronous TLS accept which can deadlock
         // if any client stalls during handshake.
         info!("TLS enabled - using rustls (async accept)");
+
+        // Spawn the HTTP/3 (QUIC) listener on the same port (UDP). Serves the
+        // base router (no Alt-Svc). Requires UDP ingress to be open on the port.
+        #[cfg(feature = "http3")]
+        {
+            let h3_addr = format!("0.0.0.0:{}", settings.port);
+            let h3_app = h3_app_base;
+            let h3_cert = settings.tls_cert_path.clone();
+            let h3_key = settings.tls_key_path.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    modules::h3::run_h3_server(&h3_addr, h3_app, &h3_cert, &h3_key).await
+                {
+                    error!("HTTP/3 server error: {}", e);
+                }
+            });
+        }
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -1157,10 +1195,14 @@ fn load_rustls_config(
     info!("Private key loaded successfully");
 
     // Create rustls server configuration
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .map_err(|e| format!("Failed to create TLS config: {}", e))?;
+
+    // Negotiate HTTP/2 for REST clients while keeping HTTP/1.1 for the WebSocket
+    // upgrade (/ws). Without ALPN, clients silently fall back to HTTP/1.1 only.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     info!("TLS configuration created successfully");
     Ok(config)
