@@ -24,8 +24,10 @@ configuration needed. This is a protocol limitation, not a missing feature.
 cargo build --release --bin arks --features http3
 ```
 
-The default build (`cargo build`) does not compile any HTTP/3 code and is
-byte-for-byte unchanged.
+The default build (`cargo build`) compiles **no** HTTP/3 / QUIC code — that is
+all behind the `http3` feature. The one behavior change that *does* ship in every
+build is ALPN: the TLS listener now advertises `h2` + `http/1.1` (see
+"Protocol negotiation" below). This is independent of the `http3` feature.
 
 ## Running
 
@@ -38,6 +40,44 @@ arks binds:
 
 TCP responses advertise HTTP/3 via `Alt-Svc: h3=":$PORT"; ma=86400`, so
 compliant clients upgrade to QUIC on their next connection.
+
+## One port, not two
+
+TCP and UDP are independent transports that share the **same port number**, so
+this is a single standard HTTPS port — `$PORT` is opened for *both* TCP and UDP.
+There is no separate H3 port.
+
+You cannot run "HTTP/3 only" and drop TCP, by design:
+
+- **H3 has no cold-start discovery.** A fresh client learns the server speaks
+  H3 only via the `Alt-Svc` header (read over an *initial TCP* connection, then
+  upgraded to QUIC) or via a **DNS HTTPS/SVCB record** with `alpn="h3"`
+  (DNS-side, optional, no code change) that lets a client attempt QUIC first.
+- **TCP is the mandatory fallback** for clients/networks that block UDP/QUIC.
+- **`/ws` only exists on TCP** (WebSocket cannot ride H3 — see above).
+
+Steady state: one HTTPS port; H3 carries all REST/discovery traffic once clients
+upgrade; TCP remains for bootstrap, fallback, and `/ws`.
+
+## Protocol negotiation (ALPN)
+
+The TLS listener advertises ALPN `h2`, `http/1.1` (in **all** builds, not just
+`http3`). REST clients negotiate HTTP/2; the `/ws` WebSocket upgrade negotiates
+`http/1.1`.
+
+> **Validate before relying on this in production:** offering `h2` first means a
+> client whose ALPN list includes `h2` may be steered onto HTTP/2, and the `/ws`
+> HTTP/1.1 `Upgrade` cannot run over h2 (no RFC 9220 extended CONNECT in this
+> stack). Native WebSocket clients (e.g. iOS OpenTDFKit) negotiate `http/1.1`
+> and are unaffected; confirm any **browser** WebSocket clients still connect.
+
+## Routing scope
+
+H3 serves the **same full router** as TCP — no allow-list. Requests that don't
+fit H3 degrade benignly: a `/ws` upgrade over H3 returns a normal 4xx, and
+gRPC-with-trailers is not relayed (the bridge forwards data frames only), so
+gRPC/ConnectRPC streaming stays on TCP. Connect-protocol unary calls work over
+H3 because their status travels in headers, not trailers.
 
 ## Deployment requirement: open UDP ingress
 
