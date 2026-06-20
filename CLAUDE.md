@@ -25,6 +25,9 @@ cargo build --release --bin arks
 
 # Release build without FairPlay
 ./production/build.sh --no-fairplay
+
+# Release build with HTTP/3 (QUIC) support
+cargo build --release --bin arks --features http3
 ```
 
 **Quick Build Script:** The `production/build.sh` script automates release builds:
@@ -280,6 +283,13 @@ export KAS_PROXY_MODE=connect                          # off | connect | rest | 
 - `rest` forwards `/kas/v2/rewrap` and `/kas/v2/kas_public_key`, replacing the local OpenTDF-compat shim.
 - `both` forwards all of the above.
 - `/ws` (NanoTDF) always stays local. See `docs/platform-proxy.md`.
+
+**Note:** For HTTP/3 (QUIC) support:
+- Optional and disabled unless built with `--features http3`.
+- Only spawned when TLS is enabled; binds UDP on the same `$PORT` as the TCP listener.
+- Serves the HTTP request/response surface (rewrap, kas_public_key, media, `.well-known`); `/ws` stays on TCP/HTTP-1.1 (classic WebSockets can't ride HTTP/3).
+- TCP responses advertise `Alt-Svc: h3=":$PORT"`. **Open UDP ingress** on `$PORT` (firewall/LB/security-groups).
+- 0-RTT is disabled (replay safety for non-idempotent rewrap/key-request). See `docs/http3.md`.
 
 ## FlatBuffers Schema Compilation
 
