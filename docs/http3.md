@@ -98,6 +98,29 @@ HTTP/3:
 - If the `http3` feature is compiled in but **TLS is disabled**, H3 cannot run
   (QUIC requires TLS) and a `warn` is logged at startup.
 
+## Multi-homed / multi-WAN hosts (`H3_BIND_HOST`)
+
+By default the QUIC listener binds `0.0.0.0` (all interfaces). That is fine for a
+single-homed host, but **breaks on a multi-homed / dual-WAN host**: a wildcard
+UDP socket sources its replies from the *default-route* interface's address, not
+the address the client actually dialed. If inbound `:443` arrives on one WAN
+(e.g. via a port-forward/DNAT to interface A) while the default route is another
+WAN (interface B), the QUIC handshake reply leaves with the wrong source IP and
+the client silently drops it — the connection never establishes, even though the
+server answered. (TCP is immune: an accepted socket pins its source to the
+address the client hit.)
+
+Set **`H3_BIND_HOST`** to the public-facing interface IP — the address inbound
+`:443` is forwarded to — so QUIC replies carry the correct source:
+
+```bash
+export H3_BIND_HOST=203.0.113.10        # the interface IP inbound :443 is DNAT'd to
+# or derive it dynamically, e.g. on macOS:
+export H3_BIND_HOST="$(ipconfig getifaddr en0)"
+```
+
+Leave it unset (or `0.0.0.0`) on a normal single-WAN host.
+
 ## Security notes
 
 - **0-RTT (early data) is disabled** (`max_early_data_size = 0`). 0-RTT data is

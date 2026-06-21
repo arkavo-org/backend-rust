@@ -1007,7 +1007,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (app, h3_listener) = {
         let h3_app_base = app.clone();
         if settings.tls_enabled {
-            let h3_addr = format!("0.0.0.0:{}", settings.port);
+            // Bind host for the QUIC listener (default: all interfaces). On a
+            // multi-homed host QUIC must reply from the address clients dialed;
+            // a wildcard (0.0.0.0) socket sources replies from the default-route
+            // interface, so on a box with inbound on one WAN and default egress
+            // on another the handshake reply carries the wrong source IP and the
+            // client drops it. Set H3_BIND_HOST to the public-facing interface IP
+            // (the address inbound :443 is DNAT'd to) so replies are sourced
+            // correctly. TCP is unaffected (accepted sockets pin their source).
+            let h3_host = env::var("H3_BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+            let h3_addr = format!("{}:{}", h3_host, settings.port);
             match std::net::UdpSocket::bind(&h3_addr) {
                 Ok(socket) => {
                     let alt_svc = modules::h3::alt_svc_header_value(settings.port);
