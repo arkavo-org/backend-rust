@@ -74,10 +74,13 @@ The TLS listener advertises ALPN `h2`, `http/1.1` (in **all** builds, not just
 ## Routing scope
 
 H3 serves the **same full router** as TCP — no allow-list. Requests that don't
-fit H3 degrade benignly: a `/ws` upgrade over H3 returns a normal 4xx, and
-gRPC-with-trailers is not relayed (the bridge forwards data frames only), so
-gRPC/ConnectRPC streaming stays on TCP. Connect-protocol unary calls work over
-H3 because their status travels in headers, not trailers.
+fit H3 degrade benignly: a `/ws` upgrade over H3 returns a normal 4xx. The
+bridge forwards data frames only and does not relay HTTP trailers, so a gRPC
+call (whose `grpc-status` rides in a trailer) would otherwise look like a silent
+200 with no status — the bridge instead returns **501 Not Implemented** for
+`application/grpc` requests, keeping gRPC on TCP. gRPC-Web and Connect-protocol
+unary calls work over H3 (their status travels in the body / headers, not
+trailers).
 
 ## Deployment requirement: open UDP ingress
 
@@ -85,6 +88,15 @@ HTTP/3 runs over **UDP**, not TCP. The server port must accept UDP in addition
 to TCP — update firewalls, security groups, and any load balancer to allow
 `udp/$PORT`. Without UDP ingress, the `Alt-Svc` advert points at an unreachable
 endpoint and clients fall back to TCP (correct, but you get no H3 benefit).
+
+The UDP socket is bound **at startup**, before the server begins advertising
+HTTP/3:
+
+- If the UDP bind **fails** (e.g. the port is already taken on UDP), H3 is
+  disabled, `Alt-Svc` is **not** advertised (so clients don't chase a dead
+  endpoint), and the failure is logged at `error` — TCP is unaffected.
+- If the `http3` feature is compiled in but **TLS is disabled**, H3 cannot run
+  (QUIC requires TLS) and a `warn` is logged at startup.
 
 ## Security notes
 
@@ -94,8 +106,15 @@ endpoint and clients fall back to TCP (correct, but you get no H3 benefit).
   guard. The only cost is one extra round trip on session resumption.
 - The QUIC config reuses the same certificate/key files and the same **ring**
   crypto provider (installed at startup) as the TCP TLS path.
-- Request bodies are bounded (2 MiB) before being handed to the router, to avoid
-  buffering unbounded memory from an untrusted peer.
+- Request bodies are bounded (2 MiB — matching axum's default body limit) before
+  being handed to the router, to avoid buffering unbounded memory from an
+  untrusted peer. An oversized *declared* `Content-Length` is rejected with
+  `413` before any buffering, and the same bound is re-checked per chunk (the
+  header can lie or be absent).
+- Concurrency is bounded so a peer cannot amplify memory/task usage: at most
+  **32 bidi + 16 uni streams per connection** (≈64 MiB worst-case buffered per
+  connection) and at most **1024 concurrent QUIC connections** (a semaphore in
+  the accept loop applies backpressure beyond that).
 - Client IP is preserved: the bridge injects `ConnectInfo(remote_address)` into
   every request, so IP-dependent policy (e.g. media geo-restriction) behaves the
   same over H3 as over TCP.

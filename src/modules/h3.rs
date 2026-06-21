@@ -57,9 +57,19 @@ fn build_h3_rustls_config(
     Ok(config)
 }
 
-/// Bind a QUIC endpoint on `addr` (UDP) and serve `app` over HTTP/3.
+/// Global cap on concurrent QUIC connections. With per-connection streams also
+/// bounded (below), this caps worst-case in-flight tasks and buffered memory
+/// regardless of how many peers connect.
+const MAX_H3_CONNECTIONS: usize = 1024;
+
+/// Serve HTTP/3 over the pre-bound QUIC `socket`.
+///
+/// The socket is bound by the caller so a hard bind error (e.g. UDP port
+/// conflict) surfaces at startup — and the caller can decide whether to
+/// advertise `Alt-Svc` — rather than dying quietly inside a detached task while
+/// TCP keeps pointing clients at a dead H3 endpoint.
 pub async fn run_h3_server(
-    addr: &str,
+    socket: std::net::UdpSocket,
     app: Router,
     cert_path: &str,
     key_path: &str,
@@ -69,21 +79,32 @@ pub async fn run_h3_server(
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_config)?));
     let transport = Arc::get_mut(&mut quinn_config.transport)
         .ok_or("failed to access QUIC transport config")?;
-    transport.max_concurrent_uni_streams(100_u8.into());
-    transport.max_concurrent_bidi_streams(100_u8.into());
+    // Each in-flight request can buffer up to MAX_H3_BODY (2 MiB), so bound the
+    // per-connection bidi streams to keep worst-case per-connection memory
+    // modest (32 * 2 MiB). HTTP/3 needs a few uni streams for control + QPACK.
+    transport.max_concurrent_uni_streams(16_u8.into());
+    transport.max_concurrent_bidi_streams(32_u8.into());
 
-    let socket = std::net::UdpSocket::bind(addr)?;
+    let local_addr = socket.local_addr()?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(quinn_config),
         socket,
         Arc::new(quinn::TokioRuntime),
     )?;
-    info!("HTTP/3 (QUIC) listening on udp://{}", addr);
+    info!("HTTP/3 (QUIC) listening on udp://{}", local_addr);
 
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_H3_CONNECTIONS));
     while let Some(connecting) = endpoint.accept().await {
+        // Backpressure: stop accepting once at the connection cap; the permit is
+        // held for the connection's lifetime and released when its task ends.
+        let permit = match conn_limit.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore is never closed while the loop runs
+        };
         let app = app.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match connecting.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
@@ -136,9 +157,48 @@ async fn handle_h3_request(
     app: Router,
     remote: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Buffer the (bounded) request body. Refuse oversized payloads rather than
-    //    buffering unbounded memory from an untrusted peer.
     const MAX_H3_BODY: usize = 2 * 1024 * 1024; // 2 MiB
+
+    // 0. Reject content types that carry their status in HTTP trailers (gRPC's
+    //    grpc-status). This bridge forwards data frames only, so a gRPC call
+    //    would otherwise get a silent 200 with no status. gRPC-Web keeps its
+    //    status in the body, so it is allowed through.
+    if req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.starts_with("application/grpc") && !ct.starts_with("application/grpc-web")
+        })
+    {
+        let resp = http::Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .body(())
+            .unwrap();
+        stream.send_response(resp).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
+    // 1. Buffer the (bounded) request body. Reject an oversized *declared*
+    //    Content-Length before buffering anything, then enforce the same bound
+    //    per chunk (the header can lie or be absent).
+    if req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|declared| declared > MAX_H3_BODY)
+    {
+        let resp = http::Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(())
+            .unwrap();
+        stream.send_response(resp).await?;
+        stream.finish().await?;
+        return Ok(());
+    }
+
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await? {
         let remaining = chunk.remaining();
@@ -230,7 +290,6 @@ mod e2e_tests {
     //! carries Content-Length but no body.
     use super::*;
     use axum::routing::get;
-    use std::time::Duration;
 
     /// Accept-any-cert verifier — local self-signed testing only.
     #[derive(Debug)]
@@ -311,18 +370,19 @@ mod e2e_tests {
         std::fs::write(&cert_path, ck.cert.pem()).unwrap();
         std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
 
-        // Reserve an ephemeral UDP port, then hand it to the server.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let server_addr = probe.local_addr().unwrap();
-        drop(probe);
+        // Bind the server's UDP socket up-front (no probe/drop race) and read the
+        // assigned port before handing the socket to the server.
+        let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
 
         let cert_s = cert_path.to_str().unwrap().to_string();
         let key_s = key_path.to_str().unwrap().to_string();
-        let addr_s = server_addr.to_string();
         tokio::spawn(async move {
-            let _ = run_h3_server(&addr_s, test_app(), &cert_s, &key_s).await;
+            let _ = run_h3_server(server_socket, test_app(), &cert_s, &key_s).await;
         });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // No fixed readiness sleep: the socket is already bound, so the kernel
+        // buffers the client's handshake datagrams until the endpoint starts
+        // reading, and QUIC retransmission covers the brief startup gap.
 
         // h3 client trusting any cert.
         let provider = Arc::new(rustls::crypto::ring::default_provider());

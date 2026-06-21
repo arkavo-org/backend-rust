@@ -996,25 +996,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tower::ServiceBuilder::new().layer(axum::middleware::from_fn(log_request_middleware)),
         );
 
-    // HTTP/3 (feature-gated). The H3 server serves the base `app`; the TCP `app`
-    // gets an Alt-Svc layer advertising h3 so HTTP/1.1/2 clients can upgrade.
-    // Alt-Svc is only meaningful to a TCP client, so the H3 path omits it.
+    // HTTP/3 (feature-gated). Bind the QUIC UDP socket up-front so a hard bind
+    // error (e.g. UDP port conflict) is visible at startup, and only advertise
+    // `Alt-Svc: h3` when H3 is actually listening — otherwise clients waste
+    // round-trips chasing a dead endpoint. The H3 server serves the base `app`
+    // (Alt-Svc is only meaningful to a TCP client). QUIC mandates TLS 1.3, so
+    // H3 only runs when TLS is enabled; the cert/key are already validated by
+    // the TCP path, so a successful UDP bind reliably implies a working listener.
     #[cfg(feature = "http3")]
-    let h3_app_base = app.clone();
-
-    #[cfg(feature = "http3")]
-    let app = {
-        let alt_svc = modules::h3::alt_svc_header_value(settings.port);
-        app.layer(axum::middleware::map_response(
-            move |mut res: axum::response::Response| {
-                let alt_svc = alt_svc.clone();
-                async move {
-                    res.headers_mut()
-                        .insert(axum::http::header::ALT_SVC, alt_svc);
-                    res
+    let (app, h3_listener) = {
+        let h3_app_base = app.clone();
+        if settings.tls_enabled {
+            let h3_addr = format!("0.0.0.0:{}", settings.port);
+            match std::net::UdpSocket::bind(&h3_addr) {
+                Ok(socket) => {
+                    let alt_svc = modules::h3::alt_svc_header_value(settings.port);
+                    let app = app.layer(axum::middleware::map_response(
+                        move |mut res: axum::response::Response| {
+                            let alt_svc = alt_svc.clone();
+                            async move {
+                                res.headers_mut()
+                                    .insert(axum::http::header::ALT_SVC, alt_svc);
+                                res
+                            }
+                        },
+                    ));
+                    (app, Some((socket, h3_app_base)))
                 }
-            },
-        ))
+                Err(e) => {
+                    error!(
+                        "HTTP/3 disabled: failed to bind UDP {} ({}); TCP unaffected, Alt-Svc not advertised",
+                        h3_addr, e
+                    );
+                    (app, None)
+                }
+            }
+        } else {
+            warn!("http3 feature is enabled but TLS is disabled; HTTP/3 (QUIC) requires TLS and will NOT start");
+            (app, None)
+        }
     };
 
     // Start RTMP server if RTMP_PORT is configured
@@ -1060,17 +1080,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // if any client stalls during handshake.
         info!("TLS enabled - using rustls (async accept)");
 
-        // Spawn the HTTP/3 (QUIC) listener on the same port (UDP). Serves the
-        // base router (no Alt-Svc). Requires UDP ingress to be open on the port.
+        // Spawn the HTTP/3 (QUIC) listener on the pre-bound UDP socket (same port
+        // as TCP). Serves the base router (no Alt-Svc). Requires UDP ingress open.
         #[cfg(feature = "http3")]
-        {
-            let h3_addr = format!("0.0.0.0:{}", settings.port);
-            let h3_app = h3_app_base;
+        if let Some((h3_socket, h3_app)) = h3_listener {
             let h3_cert = settings.tls_cert_path.clone();
             let h3_key = settings.tls_key_path.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    modules::h3::run_h3_server(&h3_addr, h3_app, &h3_cert, &h3_key).await
+                    modules::h3::run_h3_server(h3_socket, h3_app, &h3_cert, &h3_key).await
                 {
                     error!("HTTP/3 server error: {}", e);
                 }
