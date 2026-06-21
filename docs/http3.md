@@ -119,7 +119,9 @@ export H3_BIND_HOST=203.0.113.10        # the interface IP inbound :443 is DNAT'
 export H3_BIND_HOST="$(ipconfig getifaddr en0)"
 ```
 
-Leave it unset (or `0.0.0.0`) on a normal single-WAN host.
+The value may be an IPv4 address, an IPv6 literal (bare, no brackets — e.g.
+`2001:db8::10`), or a hostname. Leave it unset (or `0.0.0.0`) on a normal
+single-WAN host.
 
 ## Security notes
 
