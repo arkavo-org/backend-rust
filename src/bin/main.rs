@@ -10,7 +10,7 @@ mod modules;
 
 #[cfg(feature = "c2pa_signing")]
 use modules::c2pa_signing;
-use modules::{cbor_protocol, http_rewrap, media_api, ntdf_token, platform_proxy};
+use modules::{authzen, cbor_protocol, http_rewrap, media_api, ntdf_token, platform_proxy};
 use opentdf_kas::{
     compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
 };
@@ -939,6 +939,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
+    // AuthZEN 1.0 facade — semantic translator, independently flagged from AUTHZ_PROXY.
+    let authzen_facade = authzen::facade::enabled_from_env()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let authzen_router = if authzen_facade {
+        let url = match env::var("OPENTDF_PLATFORM_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                return Err("AUTHZEN_FACADE=on requires OPENTDF_PLATFORM_URL to be set".into());
+            }
+        };
+        let state = authzen::facade::FacadeState::from_env(&url)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        info!("AuthZEN facade enabled, upstream={}", state.platform_url);
+        authzen::facade::router(state)
+    } else {
+        Router::new()
+    };
+
     // Media DRM router
     let media_router = Router::new()
         .route("/media/v1/key-request", post(media_api::media_key_request))
@@ -990,6 +1008,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(wellknown_router)
         .merge(connect_router)
         .merge(authz_router)
+        .merge(authzen_router)
         .merge(media_router)
         .merge(c2pa_router)
         .layer(

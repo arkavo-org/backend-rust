@@ -1,0 +1,28 @@
+{
+  "entityIdentifier": {
+    "entityChain": {
+      "ephemeralId": "chain",
+      "entities": [
+        {
+          "ephemeralId": "e0",
+          "category": "CATEGORY_SUBJECT",
+          "claims": {
+            "@type": "type.googleapis.com/google.protobuf.Struct",
+            "value": {
+              "sub": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+              "iss": "https://identity.arkavo.net"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "action": { "name": "execute_tool" },
+  "resource": {
+    "ephemeralId": "git_commit",
+    "attributeValues": {
+      "fqns": ["https://arkavo.net/attr/mcp-tool/value/git_commit"]
+    }
+  },
+  "fulfillableObligationFqns": []
+}

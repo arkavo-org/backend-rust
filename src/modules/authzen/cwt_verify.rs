@@ -30,6 +30,7 @@ pub enum VerifyError {
     DuplicateKey,
     Issuer,
     Audience,
+    KeySet,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +39,21 @@ pub struct VerifyOpts<'a> {
     pub expected_aud: Option<&'a str>,
     pub expected_kid: Option<&'a [u8]>,
     pub now: i64,
+}
+
+/// Protected-header `kid` from an unpadded-base64url tagged CWT.
+pub fn header_kid(token_b64: &str) -> Result<Vec<u8>, VerifyError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token_b64.trim())
+        .map_err(|_| VerifyError::Malformed)?;
+    let inner = bytes
+        .strip_prefix(&CWT_TAG_PREFIX)
+        .ok_or(VerifyError::Malformed)?;
+    let sign1 = CoseSign1::from_slice(inner).map_err(|_| VerifyError::Malformed)?;
+    if sign1.protected.header.key_id.is_empty() {
+        return Err(VerifyError::MissingProtectedKid);
+    }
+    Ok(sign1.protected.header.key_id.clone())
 }
 
 /// Verify unpadded-base64url CWT (tag 61 + COSE_Sign1 ES256).
@@ -244,6 +260,7 @@ pub mod test_support {
         (sk, vk)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mint(
         key: &SigningKey,
         kid: &[u8],
