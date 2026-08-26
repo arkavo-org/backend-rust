@@ -27,14 +27,14 @@ Whenever the mode is anything other than `off`, `/.well-known/opentdf-configurat
 
 The platform validates that the `kas_url` claim in a rewrap request matches its
 `RegisteredKASURI` (see `service/kas/kas.go` in the platform repo). If you run
-arks at `https://kas.arkavo.net` but TDFs were minted against
+arks at `https://platform.arkavo.net` but TDFs were minted against
 `https://platform.svc`, the URL still points at platform — so direct hits or
 proxying both work.
 
-If you want clients to mint TDFs against `kas.arkavo.net` and have arks proxy
+If you want clients to mint TDFs against `platform.arkavo.net` and have arks proxy
 them through, you must either:
 
-1. Register `https://kas.arkavo.net` as platform's `RegisteredKASURI`, or
+1. Register `https://platform.arkavo.net` as platform's `RegisteredKASURI`, or
 2. Rewrite the `kas_url` field inside the signed rewrap request envelope — not
    currently supported; would require JWT re-signing with a key platform trusts.
 
