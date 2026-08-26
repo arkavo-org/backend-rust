@@ -70,13 +70,12 @@ impl CoseKeyCache {
             return Ok(());
         };
         {
-            let mut cache = self.cache.write().await;
+            let cache = self.cache.read().await;
             if let Some(last) = cache.last_fetch {
                 if last.elapsed() < KEY_REFRESH_MIN_INTERVAL {
                     return Ok(());
                 }
             }
-            cache.last_fetch = Some(Instant::now());
         }
 
         let resp = self.http.get(url).send().await.map_err(|e| {
@@ -96,7 +95,9 @@ impl CoseKeyCache {
             VerifyError::KeySet
         })?;
         log::info!("Refreshed COSE key set ({} keys)", keys.len());
-        self.cache.write().await.keys = keys.into_iter().collect();
+        let mut cache = self.cache.write().await;
+        cache.keys = keys.into_iter().collect();
+        cache.last_fetch = Some(Instant::now());
         Ok(())
     }
 }
@@ -210,5 +211,47 @@ mod tests {
             cache.resolve(b"missing").await.unwrap_err(),
             VerifyError::UnknownKid
         );
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_does_not_suppress_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_, vk) = keypair();
+        let point = vk.to_encoded_point(false);
+        let cose_key = coset::CoseKeyBuilder::new_ec2_pub_key(
+            coset::iana::EllipticCurve::P_256,
+            point.x().unwrap().to_vec(),
+            point.y().unwrap().to_vec(),
+        )
+        .algorithm(coset::iana::Algorithm::ES256)
+        .key_id(b"kid-1".to_vec())
+        .build();
+        let set = Value::Array(vec![cose_key.to_cbor_value().unwrap()]);
+        let mut key_bytes = Vec::new();
+        ciborium::ser::into_writer(&set, &mut key_bytes).unwrap();
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/cose-keys"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/cose-keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(key_bytes))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let cache = CoseKeyCache::new(format!("{}/.well-known/cose-keys", upstream.uri()));
+        assert_eq!(
+            cache.resolve(b"kid-1").await.unwrap_err(),
+            VerifyError::KeySet
+        );
+        assert_eq!(cache.resolve(b"kid-1").await.unwrap(), vk);
     }
 }

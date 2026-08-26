@@ -2,7 +2,9 @@
 
 use crate::modules::authzen::cose_keys::CoseKeyCache;
 use crate::modules::authzen::cwt_subject::{Aud, DecodedClaims};
-use crate::modules::authzen::cwt_verify::{header_kid, verify_header_token, VerifyOpts};
+use crate::modules::authzen::cwt_verify::{
+    header_kid, verify_header_token, VerifyError, VerifyOpts,
+};
 use crate::modules::authzen::discovery;
 use crate::modules::authzen::translate::{
     authzen_decision, bulk_request, deny_closed, fulfillable_from_context, get_decision_request,
@@ -10,6 +12,7 @@ use crate::modules::authzen::translate::{
     parse_get_decision_response, parse_resource_decisions, reconstruct_chain, ChainMap,
     ResourceMap, TranslateError, MAX_EVALUATIONS,
 };
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -37,14 +40,21 @@ pub struct FacadeState {
     pub upstream_bearer: Option<String>,
 }
 
-pub fn enabled_from_env() -> Result<bool, String> {
-    match std::env::var("AUTHZEN_FACADE") {
-        Err(_) => Ok(false),
-        Ok(s) => match s.to_ascii_lowercase().as_str() {
+pub(crate) fn parse_enabled_flag(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None => Ok(false),
+        Some(s) => match s.to_ascii_lowercase().as_str() {
             "off" | "" => Ok(false),
             "on" => Ok(true),
             other => Err(format!("AUTHZEN_FACADE must be off or on, got {other}")),
         },
+    }
+}
+
+pub fn enabled_from_env() -> Result<bool, String> {
+    match std::env::var("AUTHZEN_FACADE") {
+        Err(_) => parse_enabled_flag(None),
+        Ok(s) => parse_enabled_flag(Some(&s)),
     }
 }
 
@@ -166,6 +176,7 @@ fn err_json(status: StatusCode, message: &str, rid: &str) -> Response {
 enum PepAuth {
     Unauthorized,
     Forbidden,
+    KeySet,
 }
 
 async fn authenticate_pep(
@@ -183,11 +194,11 @@ async fn authenticate_pep(
         .filter(|s| !s.is_empty())
         .ok_or(PepAuth::Unauthorized)?;
     let kid = header_kid(token).map_err(|_| PepAuth::Unauthorized)?;
-    let key = state
-        .keys
-        .resolve(&kid)
-        .await
-        .map_err(|_| PepAuth::Unauthorized)?;
+    let key = match state.keys.resolve(&kid).await {
+        Ok(k) => k,
+        Err(VerifyError::KeySet) => return Err(PepAuth::KeySet),
+        Err(_) => return Err(PepAuth::Unauthorized),
+    };
     let now = chrono::Utc::now().timestamp();
     let claims = verify_header_token(
         token,
@@ -229,6 +240,11 @@ fn pep_fail(e: PepAuth, rid: &str) -> Response {
     match e {
         PepAuth::Unauthorized => err_json(StatusCode::UNAUTHORIZED, "invalid pep credential", rid),
         PepAuth::Forbidden => err_json(StatusCode::FORBIDDEN, "pep client not allowlisted", rid),
+        PepAuth::KeySet => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "key set unavailable",
+            rid,
+        ),
     }
 }
 
@@ -417,9 +433,13 @@ async fn well_known(State(state): State<Arc<FacadeState>>, headers: HeaderMap) -
 async fn evaluation(
     State(state): State<Arc<FacadeState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let rid = request_id(&headers);
+    let Json(body) = match body {
+        Ok(j) => j,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "malformed json", &rid),
+    };
     let (pep, pep_token) = match authenticate_pep(&state, &headers).await {
         Ok(v) => v,
         Err(e) => return pep_fail(e, &rid),
@@ -493,9 +513,13 @@ async fn evaluation(
 async fn evaluations(
     State(state): State<Arc<FacadeState>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let rid = request_id(&headers);
+    let Json(body) = match body {
+        Ok(j) => j,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "malformed json", &rid),
+    };
     let (pep, pep_token) = match authenticate_pep(&state, &headers).await {
         Ok(v) => v,
         Err(e) => return pep_fail(e, &rid),
@@ -648,4 +672,19 @@ fn log_eval(pep_sub: &str, p: &Prepared, permit: bool, rid: &str) {
         p.resource_type,
         permit
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_enabled_flag;
+
+    #[test]
+    fn enabled_flag_unset_off_on_local() {
+        assert_eq!(parse_enabled_flag(None).unwrap(), false);
+        assert_eq!(parse_enabled_flag(Some("")).unwrap(), false);
+        assert_eq!(parse_enabled_flag(Some("off")).unwrap(), false);
+        assert_eq!(parse_enabled_flag(Some("ON")).unwrap(), true);
+        assert!(parse_enabled_flag(Some("local")).is_err());
+        assert!(parse_enabled_flag(Some("true")).is_err());
+    }
 }
