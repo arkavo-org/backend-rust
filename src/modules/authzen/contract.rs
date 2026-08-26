@@ -67,6 +67,14 @@ fn mint_user(sk: &SigningKey) -> String {
 }
 
 fn state(upstream: &str, allowlist: Option<HashSet<String>>) -> (Arc<FacadeState>, SigningKey) {
+    state_with_upstream(upstream, allowlist, None)
+}
+
+fn state_with_upstream(
+    upstream: &str,
+    allowlist: Option<HashSet<String>>,
+    upstream_bearer: Option<String>,
+) -> (Arc<FacadeState>, SigningKey) {
     let (sk, vk) = keypair();
     let keys = CoseKeyCache::with_static_keys(vec![(KID.to_vec(), vk)]);
     let state = FacadeState::new(
@@ -75,10 +83,17 @@ fn state(upstream: &str, allowlist: Option<HashSet<String>>) -> (Arc<FacadeState
         keys,
         allowlist,
         Some("https://kas.arkavo.net".into()),
-        None,
+        upstream_bearer,
     )
     .unwrap();
     (state, sk)
+}
+
+fn assert_bearer(req: &wiremock::Request, token: &str) {
+    assert_eq!(
+        req.headers.get("authorization").unwrap().to_str().unwrap(),
+        format!("Bearer {token}")
+    );
 }
 
 async fn call(
@@ -168,6 +183,7 @@ async fn catalog_evaluations_roundtrip_multiresource() {
         received[0].headers.get("connect-protocol-version").unwrap(),
         "1"
     );
+    assert_bearer(&received[0], &token);
     let got: Value = serde_json::from_slice(&received[0].body).unwrap();
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/catalog_multiresource_request.json")).unwrap();
@@ -281,8 +297,9 @@ async fn mcp_evaluation_nested_get_decision() {
     assert_eq!(body["decision"], json!(true));
     assert_eq!(body["context"]["evaluation_id"], json!(RID));
     assert_eq!(body["context"]["obligations"]["required"], json!([]));
-    let got: Value =
-        serde_json::from_slice(&upstream.received_requests().await.unwrap()[0].body).unwrap();
+    let received = upstream.received_requests().await.unwrap();
+    assert_bearer(&received[0], &token);
+    let got: Value = serde_json::from_slice(&received[0].body).unwrap();
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/mcp_getdecision_request.json")).unwrap();
     assert_eq!(got, expected);
@@ -739,6 +756,147 @@ async fn upstream_failure_is_500_not_502() {
         .mount(&upstream)
         .await;
     let (st, sk) = state(&upstream.uri(), None);
+    let token = mint_service(&sk, "mcp-edge", false);
+    let app = facade::router(st);
+    let (status, _, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluation",
+        Some(&token),
+        Some(&mcp_req()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn mixed_actions_use_get_decision_bulk() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/authorization.v2.AuthorizationService/GetDecisionBulk",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            include_str!("fixtures/bulk_response.json"),
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/authorization.v2.AuthorizationService/GetDecisionMultiResource",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let (st, sk) = state(&upstream.uri(), None);
+    let token = mint_service(&sk, "catalog-node", false);
+    let req: Value =
+        serde_json::from_str(include_str!("fixtures/bulk_evaluations_request.json")).unwrap();
+    let app = facade::router(st);
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluations",
+        Some(&token),
+        Some(&req),
+        Some(RID),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["evaluations"][0]["decision"], json!(true));
+    assert_eq!(body["evaluations"][1]["decision"], json!(false));
+    assert_eq!(
+        body["evaluations"][0]["context"]["evaluation_id"],
+        json!(format!("{RID}:0"))
+    );
+    assert_eq!(
+        body["evaluations"][1]["context"]["evaluation_id"],
+        json!(format!("{RID}:1"))
+    );
+
+    let received = upstream.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert!(received[0]
+        .url
+        .path()
+        .ends_with("/authorization.v2.AuthorizationService/GetDecisionBulk"));
+    assert_bearer(&received[0], &token);
+    let got: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let expected: Value = serde_json::from_str(include_str!("fixtures/bulk_request.json")).unwrap();
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn static_upstream_bearer_replaces_service_cwt() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/authorization.v2.AuthorizationService/GetDecision"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            include_str!("fixtures/mcp_getdecision_response.json"),
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (st, sk) = state_with_upstream(&upstream.uri(), None, Some("static-lab-token".into()));
+    let token = mint_service(&sk, "mcp-edge", false);
+    let app = facade::router(st);
+    let (status, _, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluation",
+        Some(&token),
+        Some(&mcp_req()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let received = upstream.received_requests().await.unwrap();
+    assert_bearer(&received[0], "static-lab-token");
+    assert_ne!(
+        received[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("Bearer {token}")
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_is_400_not_422() {
+    let (st, sk) = state("http://127.0.0.1:1", None);
+    let token = mint_service(&sk, "mcp-edge", false);
+    let app = facade::router(st);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/access/v1/evaluation")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from("not-json"))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn key_set_fetch_failure_is_500() {
+    let (sk, _) = keypair();
+    let keys = CoseKeyCache::new("http://127.0.0.1:1/.well-known/cose-keys".into());
+    let st = FacadeState::new(
+        "http://127.0.0.1:1",
+        ISS.to_string(),
+        keys,
+        None,
+        Some("https://kas.arkavo.net".into()),
+        None,
+    )
+    .unwrap();
     let token = mint_service(&sk, "mcp-edge", false);
     let app = facade::router(st);
     let (status, _, _) = call(
