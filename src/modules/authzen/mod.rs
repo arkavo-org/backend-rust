@@ -6,3 +6,6 @@ pub mod cwt_verify;
 pub mod discovery;
 pub mod facade;
 pub mod translate;
+
+#[cfg(test)]
+mod contract;
