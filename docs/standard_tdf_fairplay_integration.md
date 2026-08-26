@@ -68,7 +68,7 @@ movie.tdf (ZIP archive)
     "keyAccess": [
       {
         "type": "wrapped",
-        "url": "https://kas.arkavo.com/kas",
+        "url": "https://platform.arkavo.net/kas",
         "protocol": "kas",
         "wrappedKey": "BASE64_RSA_OAEP_ENCRYPTED_DEK",
         "policyBinding": {
@@ -116,7 +116,7 @@ openssl rand -hex 16 > content_key.txt
 ### 2. Get KAS RSA Public Key
 
 ```bash
-curl -s https://kas.arkavo.com/kas/v2/kas_public_key?algorithm=rsa \
+curl -s https://platform.arkavo.net/kas/v2/kas_public_key?algorithm=rsa \
   | jq -r '.publicKey' > kas_rsa_public.pem
 ```
 
@@ -154,7 +154,7 @@ manifest = {
         "type": "split",
         "keyAccess": [{
             "type": "wrapped",
-            "url": "https://kas.arkavo.com/kas",
+            "url": "https://platform.arkavo.net/kas",
             "protocol": "kas",
             "wrappedKey": open("wrapped_key.b64").read().strip()
         }],
@@ -179,7 +179,7 @@ with open("manifest.json", "w") as f:
 ### 1. Start Playback Session
 
 ```bash
-curl -X POST https://kas.arkavo.com/media/v1/session/start \
+curl -X POST https://platform.arkavo.net/media/v1/session/start \
   -H "Content-Type: application/json" \
   -d '{
     "userId": "user123",
@@ -202,7 +202,7 @@ Response:
 # Base64 encode manifest.json
 MANIFEST_B64=$(base64 < manifest.json)
 
-curl -X POST https://kas.arkavo.com/media/v1/key-request \
+curl -X POST https://platform.arkavo.net/media/v1/key-request \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "abc123-session-id",
@@ -218,7 +218,7 @@ curl -X POST https://kas.arkavo.com/media/v1/key-request \
 If you only have the wrapped key (not full manifest):
 
 ```bash
-curl -X POST https://kas.arkavo.com/media/v1/key-request \
+curl -X POST https://platform.arkavo.net/media/v1/key-request \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "abc123-session-id",
