@@ -18,7 +18,10 @@ mod tests {
     #[test]
     fn v1_omits_search_and_signed_metadata() {
         let d = document("https://platform.arkavo.net/");
-        assert_eq!(d["policy_decision_point"], json!("https://platform.arkavo.net"));
+        assert_eq!(
+            d["policy_decision_point"],
+            json!("https://platform.arkavo.net")
+        );
         assert_eq!(
             d["access_evaluation_endpoint"],
             json!("https://platform.arkavo.net/access/v1/evaluation")
