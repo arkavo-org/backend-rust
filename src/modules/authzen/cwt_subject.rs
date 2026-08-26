@@ -1,4 +1,8 @@
 //! Verification-agnostic CWT → `$token` / SARC projection (draft-arkavo-authzen-cwt-00 PR 2).
+//! Wired by the AuthZEN facade; clippy `--bin arks` without `--tests` would
+//! otherwise treat these as dead.
+
+#![allow(dead_code)]
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -243,10 +247,8 @@ pub fn mcp_server_slug(resource_id: &str, override_slug: Option<&str>) -> String
     for c in stripped.chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
-        } else if c == '-' || c == '_' || c == '.' {
-            if !out.ends_with('_') && !out.is_empty() {
-                out.push('_');
-            }
+        } else if (c == '-' || c == '_' || c == '.') && !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
         }
     }
     out.trim_matches('_').to_string()

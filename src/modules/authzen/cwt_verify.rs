@@ -1,5 +1,9 @@
 //! Union CWT verifier (draft-arkavo-authzen-cwt-00 PR 2b).
 //! Stricter than either `authnz-rs::cwt::verify` or catalog `CwtVerifier`.
+//! Wired by the AuthZEN facade; clippy `--bin arks` without `--tests` would
+//! otherwise treat these as dead.
+
+#![allow(dead_code)]
 
 use crate::modules::authzen::cwt_subject::{Aud, DecodedClaims};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
