@@ -82,7 +82,7 @@ fn state_with_upstream(
         ISS.to_string(),
         keys,
         allowlist,
-        Some("https://kas.arkavo.net".into()),
+        Some("https://platform.arkavo.net".into()),
         upstream_bearer,
     )
     .unwrap();
@@ -682,7 +682,7 @@ async fn discovery_omits_search() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["policy_decision_point"],
-        json!("https://kas.arkavo.net")
+        json!("https://platform.arkavo.net")
     );
     assert!(body.get("search_resource_endpoint").is_none());
     assert!(body.get("signed_metadata").is_none());
@@ -893,7 +893,7 @@ async fn key_set_fetch_failure_is_500() {
         ISS.to_string(),
         keys,
         None,
-        Some("https://kas.arkavo.net".into()),
+        Some("https://platform.arkavo.net".into()),
         None,
     )
     .unwrap();

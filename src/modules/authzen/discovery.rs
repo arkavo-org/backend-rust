@@ -17,15 +17,15 @@ mod tests {
 
     #[test]
     fn v1_omits_search_and_signed_metadata() {
-        let d = document("https://kas.arkavo.net/");
-        assert_eq!(d["policy_decision_point"], json!("https://kas.arkavo.net"));
+        let d = document("https://platform.arkavo.net/");
+        assert_eq!(d["policy_decision_point"], json!("https://platform.arkavo.net"));
         assert_eq!(
             d["access_evaluation_endpoint"],
-            json!("https://kas.arkavo.net/access/v1/evaluation")
+            json!("https://platform.arkavo.net/access/v1/evaluation")
         );
         assert_eq!(
             d["access_evaluations_endpoint"],
-            json!("https://kas.arkavo.net/access/v1/evaluations")
+            json!("https://platform.arkavo.net/access/v1/evaluations")
         );
         assert!(d.get("search_resource_endpoint").is_none());
         assert!(d.get("search_subject_endpoint").is_none());
