@@ -8,7 +8,7 @@ modern ZTDF rewrap (handled by platform).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OPENTDF_PLATFORM_URL` | — | Upstream base URL, e.g. `https://platform.svc:8443`. Required when `KAS_PROXY_MODE` ≠ `off`, `AUTHZ_PROXY=on`, or `AUTHZEN_FACADE=on`. Loopback is allowed. |
+| `OPENTDF_PLATFORM_URL` | — | Upstream base URL. Required when `KAS_PROXY_MODE` ≠ `off`, `AUTHZ_PROXY=on`, or `AUTHZEN_FACADE=on`. Production co-located sidecar is `http://127.0.0.1:8181` (`:8443` on that box is Docker). Loopback is allowed. |
 | `KAS_PROXY_MODE` | `off` | One of `off`, `connect`, `rest`, `both`. |
 | `AUTHZ_PROXY` | `off` | `on` forwards `/authorization.v2.AuthorizationService/*` to platform. Independent of `KAS_PROXY_MODE` and of `AUTHZEN_FACADE`; requires `OPENTDF_PLATFORM_URL`. |
 | `AUTHZEN_FACADE` | `off` | `off` or `on` only. `on` serves AuthZEN 1.0 `/access/v1/evaluation`, `/access/v1/evaluations`, and `GET /.well-known/authzen-configuration`. Independent of `AUTHZ_PROXY`. Requires `OPENTDF_PLATFORM_URL`. There is no built-in evaluator. |
