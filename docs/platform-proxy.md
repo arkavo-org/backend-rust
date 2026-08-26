@@ -69,20 +69,31 @@ The PEP authenticates with a **service CWT** (`Authorization: Bearer`). SARC
 When both flags are on, PEPs must pin the AuthZEN well-known URLs and must not
 POST to `/authorization.v2.AuthorizationService/*`.
 
-### Caller-credential spike (blocked)
+### Caller-credential spike (2026-08-26, TLS renewed)
 
-PR 3's entry criterion was to confirm that production `platform.arkavo.net`
-accepts a service CWT as the Connect caller credential, and to confirm the
-deployed OpenTDF identifier charset.
+PR 3's entry criterion: confirm production `platform.arkavo.net` accepts a
+**service CWT** as the Connect caller, and confirm the deployed identifier
+charset.
 
-**Not executed.** Production TLS on `platform.arkavo.net` is expired; this
-checkout must not call production. Tests use a mock OpenTDF (wiremock). The
-facade **forwards the verified PEP service CWT** as `Authorization: Bearer` to
-OpenTDF (the hypothesized production path). If a lab later proves the platform
-is JWT-only, set `AUTHZEN_UPSTREAM_BEARER` to a platform-acceptable token (or
-implement mint/exchange) — PEPs still send service CWT to the facade. The
-identifier charset `^[a-zA-Z0-9](?:[a-zA-Z0-9_-]*[a-zA-Z0-9])?$` is enforced
-on mapped OpenTDF action names and derived attribute values regardless.
+| Check | Result |
+|---|---|
+| TLS | Let's Encrypt renewed. `platform.arkavo.net` notAfter 2026-11-24 20:26:29 GMT; `identity.arkavo.net` notAfter 2026-11-24 20:18:30 GMT. `curl` without `-k` returns 200 on well-known. |
+| Identifier charset | `GET /attributes` — 16 live values (`public`, `exclusive-content`, `early-access`, …). **0 violations** of `^[a-zA-Z0-9](?:[a-zA-Z0-9_-]*[a-zA-Z0-9])?$`. |
+| IdP | `access_token_format: application/cwt`; `cose_keys_uri` present; `client_credentials` advertised. Access tokens are CWT (`authnz-rs` `mint_access_token`). |
+| Platform well-known | Mirrors IdP: `idp.access_token_format: application/cwt`, `idp.cose_keys_uri`. |
+| Connect caller format | **CWT, not JWT.** Deployed code is [arkavo-org/opentdf-platform](https://github.com/arkavo-org/opentdf-platform) (`feat(auth): cut inbound bearer verification from JWT to CWT`, 2026-05-25). `newTokenVerifier` requires `cose_keys_uri` and builds `CWTVerifier`. Upstream `opentdf/platform` `main` is still JWT/`jwks_uri` — do not use that as the production model. |
+| Live GetDecision | No Authorization → 401 `missing authorization header`. Compact JWT, opaque garbage, and a well-formed CWT signed with a **non-IdP** key → 401 `unauthenticated`. A production-signed service CWT was not minted here (no `catalog-node` client secret in this environment). |
+
+**Production path:** the facade **forwards the verified PEP service CWT** as
+`Authorization: Bearer` to OpenTDF. Do **not** mint/exchange a JWT for the
+Connect caller. `AUTHZEN_UPSTREAM_BEARER` remains a test/lab override only.
+
+Service CWT `aud` must include the platform's configured audience
+(`OIDC_PLATFORM_AUDIENCE`, commonly `https://platform.arkavo.net`) — the
+fork's `CWTVerifier` checks `aud` against that value.
+
+The identifier charset is enforced on mapped OpenTDF action names and derived
+attribute values regardless.
 
 ## What is NOT proxied
 
@@ -96,5 +107,4 @@ on mapped OpenTDF action names and derived attribute values regardless.
 - No JWT re-signing — clients must present credentials platform accepts.
 - No request-body rewriting (e.g. `kas_url` rewrite).
 - No request streaming — bodies are buffered up to 16 MiB before forwarding.
-- Live `platform.arkavo.net` caller-credential spike (TLS expired; see AuthZEN facade).
 - AuthZEN Resource Search (`GetEntitlements`) — phase 6.
