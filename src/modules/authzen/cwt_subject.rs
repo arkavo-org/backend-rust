@@ -29,6 +29,7 @@ pub struct DecodedClaims {
     pub aud: Aud,
     pub exp: u64,
     pub iat: u64,
+    pub nbf: Option<u64>,
     pub cti: Vec<u8>,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
@@ -104,7 +105,9 @@ fn sanitize_patreon(p: &Value) -> Value {
         return p.clone();
     };
     let mut out = obj.clone();
-    if out.get("role").and_then(Value::as_str) == Some("consumer") {
+    // Allowlist, not denylist: only a creator may carry campaign_id. An absent,
+    // mis-cased or non-string role redacts rather than passing the field through.
+    if out.get("role").and_then(Value::as_str) != Some("creator") {
         out.remove("campaign_id");
     }
     Value::Object(out)
@@ -235,27 +238,42 @@ pub fn context_agent(claims: &DecodedClaims, platform_audience: Option<&str>) ->
 }
 
 /// Lowercase slug matching OpenTDF attribute-value charset.
-pub fn mcp_server_slug(resource_id: &str, override_slug: Option<&str>) -> String {
-    if let Some(s) = override_slug.filter(|s| !s.is_empty()) {
-        return s.to_ascii_lowercase();
-    }
-    let stripped = resource_id
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+/// OpenTDF attribute-value charset. Alphanumerics lowercase, `-` is preserved
+/// (it is legal in an attribute value and keeps `a-b` distinct from `a.b`), and
+/// every other run of characters collapses to a single `_` separator. Dropping
+/// those characters outright — as this used to — made distinct identities
+/// collide: `.../tenant/a` and `.../tenanta` both slugged to the same value,
+/// which an OpenTDF policy would then treat as one server.
+fn slugify(input: &str) -> String {
     let mut out = String::new();
-    for c in stripped.chars() {
-        if c.is_ascii_alphanumeric() {
+    let mut pending_sep = false;
+    for c in input.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            if pending_sep && !out.is_empty() {
+                out.push('_');
+            }
+            pending_sep = false;
             out.push(c.to_ascii_lowercase());
-        } else if (c == '-' || c == '_' || c == '.') && !out.ends_with('_') && !out.is_empty() {
-            out.push('_');
+        } else {
+            pending_sep = true;
         }
     }
     out.trim_matches('_').to_string()
 }
 
+pub fn mcp_server_slug(resource_id: &str, override_slug: Option<&str>) -> String {
+    if let Some(s) = override_slug.filter(|s| !s.is_empty()) {
+        return slugify(s);
+    }
+    let stripped = resource_id
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    slugify(stripped)
+}
+
 pub fn tool_value_slug(tool_name: &str) -> String {
-    tool_name.replace('.', "_").to_ascii_lowercase()
+    slugify(tool_name)
 }
 
 #[cfg(test)]
@@ -272,6 +290,7 @@ mod tests {
             ]),
             exp: 1_780_000_000,
             iat: 1_779_996_400,
+            nbf: None,
             cti: vec![0u8; 16],
             email: Some("a@example.com".into()),
             email_verified: Some(true),
@@ -495,5 +514,69 @@ mod tests {
         );
         assert_eq!(tool_value_slug("git.commit"), "git_commit");
         assert_eq!(tool_value_slug("filesystem_read"), "filesystem_read");
+    }
+
+    // --- redaction must fail closed (allowlist, not denylist) ---
+
+    #[test]
+    fn patreon_redacts_campaign_id_when_role_missing() {
+        let mut c = oidc_pe();
+        c.arkavo_patreon = Some(json!({
+            "campaign_id": "87654321",
+            "memberships": []
+        }));
+        let p = token_map(&c)["arkavo_patreon"].clone();
+        assert!(p.get("campaign_id").is_none());
+    }
+
+    #[test]
+    fn patreon_redacts_campaign_id_for_unknown_role() {
+        for role in [json!("Consumer"), json!("subscriber"), json!(7)] {
+            let mut c = oidc_pe();
+            c.arkavo_patreon = Some(json!({
+                "role": role,
+                "campaign_id": "87654321"
+            }));
+            let p = token_map(&c)["arkavo_patreon"].clone();
+            assert!(
+                p.get("campaign_id").is_none(),
+                "campaign_id leaked for role {role:?}"
+            );
+        }
+    }
+
+    // --- slugs must not collide across distinct server identities ---
+
+    #[test]
+    fn mcp_slug_distinguishes_path_boundaries() {
+        assert_ne!(
+            mcp_server_slug("https://mcp.example.net/tenant/a", None),
+            mcp_server_slug("https://mcp.example.net/tenanta", None)
+        );
+    }
+
+    #[test]
+    fn mcp_slug_distinguishes_port_and_hyphen() {
+        assert_ne!(
+            mcp_server_slug("https://mcp.example.net:8443", None),
+            mcp_server_slug("https://mcp.example.net8443", None)
+        );
+        assert_ne!(
+            mcp_server_slug("https://mcp-example.net", None),
+            mcp_server_slug("https://mcp.example.net", None)
+        );
+    }
+
+    #[test]
+    fn mcp_slug_override_is_sanitized() {
+        assert_eq!(
+            mcp_server_slug("x", Some("Bad Slug/../evil")),
+            "bad_slug_evil"
+        );
+    }
+
+    #[test]
+    fn tool_slug_is_sanitized() {
+        assert_eq!(tool_value_slug("git commit --amend"), "git_commit_--amend");
     }
 }

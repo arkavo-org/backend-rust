@@ -21,6 +21,7 @@ pub const SKEW_SECS: i64 = 60;
 pub enum VerifyError {
     Malformed,
     UnsupportedAlg,
+    UnsupportedCritical,
     MissingProtectedKid,
     UnknownKid,
     Signature,
@@ -65,6 +66,11 @@ pub fn verify_tagged_bytes(
         Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
         _ => return Err(VerifyError::UnsupportedAlg),
     }
+    // RFC 9052 3.1: a recipient MUST reject a message carrying a `crit` label
+    // it does not understand. This verifier processes only `alg` and `kid`.
+    if !sign1.protected.header.crit.is_empty() {
+        return Err(VerifyError::UnsupportedCritical);
+    }
     if sign1.protected.header.key_id.is_empty() {
         return Err(VerifyError::MissingProtectedKid);
     }
@@ -104,6 +110,11 @@ pub fn verify_tagged_bytes(
     if (claims.iat as i64) > opts.now + SKEW_SECS {
         return Err(VerifyError::NotYetValid);
     }
+    if let Some(nbf) = claims.nbf {
+        if (nbf as i64) > opts.now + SKEW_SECS {
+            return Err(VerifyError::NotYetValid);
+        }
+    }
     Ok(claims)
 }
 
@@ -117,6 +128,7 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
     let mut sub = None;
     let mut aud = None;
     let mut exp = None;
+    let mut nbf = None;
     let mut iat = None;
     let mut cti = None;
     let mut email = None;
@@ -151,11 +163,14 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
                     }
                     aud = Some(Aud::Many(v));
                 }
-                (4, Value::Integer(n)) => {
-                    exp = u64::try_from(i128::from(n)).ok();
+                (4, ref v) => {
+                    exp = numeric_date(v);
                 }
-                (6, Value::Integer(n)) => {
-                    iat = u64::try_from(i128::from(n)).ok();
+                (5, ref v) => {
+                    nbf = numeric_date(v);
+                }
+                (6, ref v) => {
+                    iat = numeric_date(v);
                 }
                 (7, Value::Bytes(b)) => cti = Some(b),
                 _ => {}
@@ -185,6 +200,7 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
         sub: sub.ok_or(VerifyError::MissingClaim("sub"))?,
         aud: aud.ok_or(VerifyError::MissingClaim("aud"))?,
         exp: exp.ok_or(VerifyError::MissingClaim("exp"))?,
+        nbf,
         iat: iat.ok_or(VerifyError::MissingClaim("iat"))?,
         cti: cti.ok_or(VerifyError::MissingClaim("cti"))?,
         email,
@@ -196,6 +212,15 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
         client_id,
         arkavo_patreon,
     })
+}
+
+/// RFC 8392 NumericDate: a CBOR integer or float. Fractional seconds truncate.
+fn numeric_date(v: &Value) -> Option<u64> {
+    match v {
+        Value::Integer(n) => u64::try_from(i128::from(*n)).ok(),
+        Value::Float(f) if f.is_finite() && *f >= 0.0 => Some(f.trunc() as u64),
+        _ => None,
+    }
 }
 
 fn text_array(a: Vec<Value>) -> Result<Vec<String>, VerifyError> {
@@ -212,9 +237,17 @@ fn cbor_to_json(v: &Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Integer(i) => {
+            // serde_json numbers are i64/u64; anything wider would panic through
+            // `json!`, so fall back to the decimal string rather than dropping it.
             let n = i128::from(*i);
-            serde_json::json!(n)
+            i64::try_from(n)
+                .map(serde_json::Value::from)
+                .or_else(|_| u64::try_from(n).map(serde_json::Value::from))
+                .unwrap_or_else(|_| serde_json::Value::String(n.to_string()))
         }
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Array(a) => serde_json::Value::Array(a.iter().map(cbor_to_json).collect()),
         Value::Map(m) => {
@@ -266,6 +299,35 @@ pub mod test_support {
                 (Value::Integer(7.into()), Value::Bytes(cti.to_vec())),
             ],
         )
+    }
+
+    pub fn other_keypair() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_slice(&[0x29u8; 32]).expect("scalar");
+        let vk = *sk.verifying_key();
+        (sk, vk)
+    }
+
+    /// Mint with a caller-supplied protected header (alg / kid / crit tests).
+    pub fn mint_with_protected(
+        key: &SigningKey,
+        protected: coset::Header,
+        entries: Vec<(Value, Value)>,
+    ) -> String {
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut payload).unwrap();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |to_sign| {
+                let sig: Signature = key.sign(to_sign);
+                sig.to_bytes().to_vec()
+            })
+            .build();
+        let inner = sign1.to_vec().unwrap();
+        let mut out = Vec::with_capacity(CWT_TAG_PREFIX.len() + inner.len());
+        out.extend_from_slice(&CWT_TAG_PREFIX);
+        out.extend_from_slice(&inner);
+        URL_SAFE_NO_PAD.encode(out)
     }
 
     pub fn mint_map(key: &SigningKey, kid: &[u8], entries: Vec<(Value, Value)>) -> String {
@@ -472,5 +534,184 @@ mod tests {
             verify_header_token(&t, &vk, opts()),
             Err(VerifyError::DuplicateKey)
         ));
+    }
+
+    fn base_entries() -> Vec<(Value, Value)> {
+        vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("https://identity.test".into()),
+            ),
+            (Value::Integer(2.into()), Value::Text("arkavo:u1".into())),
+            (Value::Integer(3.into()), Value::Text("arkavo".into())),
+            (
+                Value::Integer(4.into()),
+                Value::Integer((NOW + 3600).into()),
+            ),
+            (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![7u8; 16])),
+        ]
+    }
+
+    fn es256_header() -> coset::Header {
+        coset::HeaderBuilder::new()
+            .algorithm(coset::iana::Algorithm::ES256)
+            .key_id(KID.to_vec())
+            .build()
+    }
+
+    // --- signature / header rejection branches (previously untested) ---
+
+    #[test]
+    fn reject_signature_from_other_key() {
+        let (_, vk) = keypair();
+        let (other_sk, _) = super::test_support::other_keypair();
+        assert!(matches!(
+            verify_header_token(&token(&other_sk), &vk, opts()),
+            Err(VerifyError::Signature)
+        ));
+    }
+
+    #[test]
+    fn reject_non_es256_alg() {
+        let (sk, vk) = keypair();
+        let protected = coset::HeaderBuilder::new()
+            .algorithm(coset::iana::Algorithm::ES384)
+            .key_id(KID.to_vec())
+            .build();
+        let t = super::test_support::mint_with_protected(&sk, protected, base_entries());
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::UnsupportedAlg)
+        ));
+    }
+
+    #[test]
+    fn reject_missing_protected_kid() {
+        let (sk, vk) = keypair();
+        let protected = coset::HeaderBuilder::new()
+            .algorithm(coset::iana::Algorithm::ES256)
+            .build();
+        let t = super::test_support::mint_with_protected(&sk, protected, base_entries());
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::MissingProtectedKid)
+        ));
+    }
+
+    #[test]
+    fn reject_issuer_mismatch() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e[0] = (
+            Value::Integer(1.into()),
+            Value::Text("https://evil.test".into()),
+        );
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::Issuer)
+        ));
+    }
+
+    /// RFC 9052 3.1: reject a message marking a header critical we do not process.
+    #[test]
+    fn reject_unknown_critical_header() {
+        let (sk, vk) = keypair();
+        let protected = coset::HeaderBuilder::new()
+            .algorithm(coset::iana::Algorithm::ES256)
+            .key_id(KID.to_vec())
+            .add_critical(coset::iana::HeaderParameter::ContentType)
+            .build();
+        let t = super::test_support::mint_with_protected(&sk, protected, base_entries());
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::UnsupportedCritical)
+        ));
+    }
+
+    // --- nbf (RFC 8392 claim 5) ---
+
+    #[test]
+    fn reject_nbf_in_future() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e.push((
+            Value::Integer(5.into()),
+            Value::Integer((NOW + 86_400).into()),
+        ));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::NotYetValid)
+        ));
+    }
+
+    #[test]
+    fn accept_nbf_in_past() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e.push((
+            Value::Integer(5.into()),
+            Value::Integer((NOW - 3600).into()),
+        ));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(verify_header_token(&t, &vk, opts()).is_ok());
+    }
+
+    // --- NumericDate may be a CBOR float (RFC 8392) ---
+
+    #[test]
+    fn accept_float_numeric_dates() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e[3] = (Value::Integer(4.into()), Value::Float((NOW + 3600) as f64));
+        e[4] = (Value::Integer(6.into()), Value::Float(NOW as f64));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        let claims = verify_header_token(&t, &vk, opts()).expect("float NumericDate is valid");
+        assert_eq!(claims.exp, (NOW + 3600) as u64);
+        assert_eq!(claims.iat, NOW as u64);
+    }
+
+    // --- cbor_to_json robustness ---
+
+    #[test]
+    fn out_of_range_cbor_integer_does_not_panic() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e.push((
+            Value::Text("arkavo_patreon".into()),
+            Value::Map(vec![(
+                Value::Text("huge".into()),
+                Value::Integer(
+                    i128::from(i64::MIN)
+                        .checked_sub(1)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+            )]),
+        ));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        let claims = verify_header_token(&t, &vk, opts()).expect("must not panic");
+        let p = claims.arkavo_patreon.expect("patreon present");
+        assert_eq!(p["huge"], serde_json::json!("-9223372036854775809"));
+    }
+
+    #[test]
+    fn cbor_float_survives_json_conversion() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e.push((
+            Value::Text("arkavo_patreon".into()),
+            Value::Map(vec![(
+                Value::Text("verified_at".into()),
+                Value::Float(1779996400.5),
+            )]),
+        ));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        let claims = verify_header_token(&t, &vk, opts()).expect("float value is valid");
+        let p = claims.arkavo_patreon.expect("patreon present");
+        assert_eq!(p["verified_at"].as_f64(), Some(1779996400.5));
     }
 }
