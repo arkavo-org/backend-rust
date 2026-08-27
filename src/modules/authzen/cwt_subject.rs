@@ -70,6 +70,9 @@ pub fn token_map(claims: &DecodedClaims) -> Value {
     );
     m.insert("exp".into(), json!(claims.exp));
     m.insert("iat".into(), json!(claims.iat));
+    if let Some(nbf) = claims.nbf {
+        m.insert("nbf".into(), json!(nbf));
+    }
     m.insert("cti".into(), json!(URL_SAFE_NO_PAD.encode(&claims.cti)));
     insert_opt_str(&mut m, "email", claims.email.as_deref());
     if let Some(v) = claims.email_verified {
@@ -100,15 +103,34 @@ fn insert_opt_str(m: &mut Map<String, Value>, k: &str, v: Option<&str>) {
     }
 }
 
+/// Fields of `arkavo_patreon` that may reach the PDP. Everything else — OAuth
+/// access/refresh tokens, e-mail, anything a future issuer adds — is dropped:
+/// this projection is copied into `$token` and `subject.properties` and lands
+/// in decision logs, so it must be an allowlist, not a denylist of one key.
+const PATREON_ALLOWED: [&str; 5] = [
+    "role",
+    "patreon_user_id",
+    "memberships",
+    "verified_at",
+    "cache_expires_at",
+];
+
 fn sanitize_patreon(p: &Value) -> Value {
     let Some(obj) = p.as_object() else {
-        return p.clone();
+        return Value::Object(Map::new());
     };
-    let mut out = obj.clone();
-    // Allowlist, not denylist: only a creator may carry campaign_id. An absent,
-    // mis-cased or non-string role redacts rather than passing the field through.
-    if out.get("role").and_then(Value::as_str) != Some("creator") {
-        out.remove("campaign_id");
+    let mut out = Map::new();
+    for k in PATREON_ALLOWED {
+        if let Some(v) = obj.get(k) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    // Only a creator may carry campaign_id. An absent, mis-cased or non-string
+    // role redacts rather than passing the field through.
+    if obj.get("role").and_then(Value::as_str) == Some("creator") {
+        if let Some(v) = obj.get("campaign_id") {
+            out.insert("campaign_id".into(), v.clone());
+        }
     }
     Value::Object(out)
 }
@@ -244,6 +266,12 @@ pub fn context_agent(claims: &DecodedClaims, platform_audience: Option<&str>) ->
 /// those characters outright — as this used to — made distinct identities
 /// collide: `.../tenant/a` and `.../tenanta` both slugged to the same value,
 /// which an OpenTDF policy would then treat as one server.
+///
+/// This narrows the collision class but does not eliminate it: separators are
+/// not distinguished from one another, so `host:8443` and `host/8443` still
+/// share a slug. Closing that needs an encoding the spec has to pin down
+/// (draft-arkavo-authzen-cwt-00) — pass an explicit `override_slug` for any
+/// identifier that is not a bare `host[:port]` until then.
 fn slugify(input: &str) -> String {
     let mut out = String::new();
     let mut pending_sep = false;
@@ -265,10 +293,14 @@ pub fn mcp_server_slug(resource_id: &str, override_slug: Option<&str>) -> String
     if let Some(s) = override_slug.filter(|s| !s.is_empty()) {
         return slugify(s);
     }
-    let stripped = resource_id
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    // strip_prefix on a lowercased copy: trim_start_matches would strip a
+    // repeated scheme ("https://https://evil.example" -> "evil.example") and
+    // the match must not be case-sensitive ("HTTPS://" is the same server).
+    let lower = resource_id.trim().to_ascii_lowercase();
+    let stripped = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(lower.as_str());
     slugify(stripped)
 }
 
@@ -578,5 +610,50 @@ mod tests {
     #[test]
     fn tool_slug_is_sanitized() {
         assert_eq!(tool_value_slug("git commit --amend"), "git_commit_--amend");
+    }
+
+    #[test]
+    fn patreon_projection_is_a_field_allowlist() {
+        let mut c = oidc_pe();
+        c.arkavo_patreon = Some(json!({
+            "role": "creator",
+            "patreon_user_id": "12345678",
+            "campaign_id": "87654321",
+            "memberships": [],
+            "verified_at": 1779996400,
+            "cache_expires_at": 1780000000,
+            "patreon_access_token": "SECRET-oauth-token",
+            "patreon_refresh_token": "SECRET-refresh",
+            "email": "leak@example.com"
+        }));
+        let p = token_map(&c)["arkavo_patreon"].clone();
+        for leaked in ["patreon_access_token", "patreon_refresh_token", "email"] {
+            assert!(p.get(leaked).is_none(), "{leaked} must not reach the PDP");
+        }
+        assert_eq!(p["role"], json!("creator"));
+        assert_eq!(p["campaign_id"], json!("87654321"));
+    }
+
+    #[test]
+    fn token_map_projects_nbf() {
+        let mut c = oidc_pe();
+        c.nbf = Some(1_779_996_400);
+        assert_eq!(token_map(&c)["nbf"], json!(1_779_996_400u64));
+    }
+
+    #[test]
+    fn mcp_slug_scheme_strip_is_case_insensitive() {
+        assert_eq!(
+            mcp_server_slug("HTTPS://mcp.example.net", None),
+            mcp_server_slug("https://mcp.example.net", None)
+        );
+    }
+
+    #[test]
+    fn mcp_slug_does_not_strip_repeated_schemes() {
+        assert_ne!(
+            mcp_server_slug("https://https://evil.example", None),
+            mcp_server_slug("https://evil.example", None)
+        );
     }
 }
