@@ -115,7 +115,7 @@ const PATREON_ALLOWED: [&str; 5] = [
     "cache_expires_at",
 ];
 
-fn sanitize_patreon(p: &Value) -> Value {
+pub fn sanitize_patreon(p: &Value) -> Value {
     let Some(obj) = p.as_object() else {
         return Value::Object(Map::new());
     };

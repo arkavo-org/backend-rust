@@ -1,8 +1,8 @@
 //! SARC ↔ OpenTDF v2 proto-JSON (claims-mode entity chain only).
 
 use crate::modules::authzen::cwt_subject::{
-    allowlist_environment, device_to_value, devices_bind, devices_from_context, tool_value_slug,
-    DeviceError, DEVICECHECK_AUD,
+    allowlist_environment, device_to_value, devices_bind, devices_from_context, sanitize_patreon,
+    tool_value_slug, DeviceError, DEVICECHECK_AUD,
 };
 use serde_json::{json, Map, Value};
 
@@ -237,10 +237,17 @@ fn pe_claims(subject: &Value) -> Result<Value, TranslateError> {
             m.insert("email".into(), email.clone());
         }
         if let Some(patreon) = props.get("arkavo_patreon") {
-            m.insert("arkavo_patreon".into(), patreon.clone());
+            // `subject` is PEP-supplied and unsigned, so the same allowlist the
+            // CWT->SARC direction applies must apply here. This is the only path
+            // that reaches the PDP: without it a PEP can assert campaign_id for
+            // a consumer (the catalog policy keys on
+            // patreon.arkavo.com/attr/campaign/value/<campaign_id>) and can push
+            // OAuth tokens into the upstream request and its decision log.
+            let patreon = sanitize_patreon(patreon);
             if let Some(uid) = patreon.get("patreon_user_id") {
                 m.insert("patreon_user_id".into(), uid.clone());
             }
+            m.insert("arkavo_patreon".into(), patreon);
         }
     }
     Ok(Value::Object(m))
@@ -811,5 +818,35 @@ mod tests {
             &fulfillable_from_context(req.get("context")),
         );
         assert_eq!(body, expected);
+    }
+
+    /// `context`/`subject` are PEP-supplied and unsigned. The patreon redaction
+    /// must apply here too — this is the only path that reaches the PDP.
+    #[test]
+    fn pe_claims_sanitizes_pep_supplied_patreon() {
+        let subject = json!({
+            "type": "identity",
+            "id": "arkavo:u1",
+            "properties": {
+                "iss": "https://identity.arkavo.net",
+                "arkavo_patreon": {
+                    "role": "consumer",
+                    "campaign_id": "87654321",
+                    "patreon_user_id": "12345678",
+                    "patreon_access_token": "SECRET-oauth-token"
+                }
+            }
+        });
+        let claims = pe_claims(&subject).unwrap();
+        let p = &claims["arkavo_patreon"];
+        assert!(
+            p.get("campaign_id").is_none(),
+            "a consumer must not carry campaign_id to the PDP"
+        );
+        assert!(
+            p.get("patreon_access_token").is_none(),
+            "OAuth tokens must not reach the PDP or its decision log"
+        );
+        assert_eq!(p["role"], json!("consumer"));
     }
 }
