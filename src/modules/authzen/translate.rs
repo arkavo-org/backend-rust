@@ -227,6 +227,13 @@ fn pe_claims(subject: &Value) -> Result<Value, TranslateError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or(TranslateError::Malformed("subject.id"))?;
+    // NOTE: this forwards a deliberately narrow subset of subject.properties.
+    // `cwt_subject::subject()` emits email_verified, idp, arkavo_account_id,
+    // arkavo_roles and arkavo_entitlements, and this drops all five (see the
+    // explicit assertion in chain_pe_then_devices_then_env_mismatched_prefix_bind).
+    // If any OpenTDF subject mapping keys on those claims it can never match,
+    // so the two halves need to agree — resolve against draft-arkavo-authzen-cwt-00
+    // before this ships.
     let mut m = Map::new();
     m.insert("sub".into(), json!(id));
     if let Some(props) = subject.get("properties").and_then(Value::as_object) {

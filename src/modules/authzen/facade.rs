@@ -38,6 +38,10 @@ pub struct FacadeState {
     pub http: reqwest::Client,
     /// When set, sent as OpenTDF `Authorization` instead of the PEP service CWT.
     pub upstream_bearer: Option<String>,
+    /// When set, a PEP token's `aud` must contain this in addition to its own
+    /// client id — otherwise a service CWT minted for any other relying party
+    /// of the same issuer authenticates here.
+    pub expected_aud: Option<String>,
 }
 
 pub(crate) fn parse_enabled_flag(raw: Option<&str>) -> Result<bool, String> {
@@ -82,6 +86,15 @@ impl FacadeState {
         let upstream_bearer = std::env::var("AUTHZEN_UPSTREAM_BEARER")
             .ok()
             .filter(|s| !s.is_empty());
+        let expected_aud = std::env::var("AUTHZEN_EXPECTED_AUD")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if public_url.is_none() {
+            log::warn!(
+                "AUTHZEN_PUBLIC_URL is unset; the discovery document will be derived \
+                 from the request Host header. Set it in production."
+            );
+        }
         Self::new(
             platform_url,
             issuer,
@@ -89,6 +102,7 @@ impl FacadeState {
             pep_client_ids,
             public_url,
             upstream_bearer,
+            expected_aud,
         )
     }
 
@@ -99,6 +113,7 @@ impl FacadeState {
         pep_client_ids: Option<HashSet<String>>,
         public_url: Option<String>,
         upstream_bearer: Option<String>,
+        expected_aud: Option<String>,
     ) -> Result<Arc<Self>, String> {
         let parsed =
             Url::parse(platform_url).map_err(|e| format!("invalid OPENTDF_PLATFORM_URL: {e}"))?;
@@ -121,6 +136,7 @@ impl FacadeState {
             keys,
             http,
             upstream_bearer,
+            expected_aud,
         }))
     }
 }
@@ -143,20 +159,29 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
+/// hostname[:port], nothing that could smuggle a scheme, path or userinfo.
+fn is_plausible_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+}
+
 fn public_base(state: &FacadeState, headers: &HeaderMap) -> String {
     if let Some(u) = &state.public_url {
         return u.trim_end_matches('/').to_string();
     }
+    // Deliberately does NOT read x-forwarded-host / x-forwarded-proto: there is
+    // no trusted-proxy configuration here, so those are attacker-supplied and
+    // would let a caller point every PEP that bootstraps from this document at
+    // a PDP of their choosing. Host is still client-supplied, hence the startup
+    // warning telling operators to set AUTHZEN_PUBLIC_URL.
     let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(axum::http::header::HOST))
+        .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
+        .filter(|h| is_plausible_host(h))
         .unwrap_or("localhost");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("https");
-    format!("{proto}://{host}")
+    format!("https://{host}")
 }
 
 fn with_rid(mut res: Response, rid: &str) -> Response {
@@ -227,6 +252,15 @@ async fn authenticate_pep(
     };
     if !aud_ok {
         return Err(PepAuth::Unauthorized);
+    }
+    if let Some(want) = &state.expected_aud {
+        let bound = match &claims.aud {
+            Aud::One(s) => s == want,
+            Aud::Many(v) => v.iter().any(|s| s == want),
+        };
+        if !bound {
+            return Err(PepAuth::Unauthorized);
+        }
     }
     if let Some(allow) = &state.pep_client_ids {
         if !allow.contains(client_id) {
@@ -368,11 +402,26 @@ fn apply_decisions(
     }
     for (index, eid, _) in items {
         let d = by_id.get_mut(eid).and_then(|q| q.pop_front());
-        let (permit, obls) = match d {
-            Some(d) => (d.permit, d.required_obligations.clone()),
-            None => (false, Vec::new()),
+        results[*index] = match d {
+            Some(d) => Some(authzen_decision(
+                d.permit,
+                rid,
+                Some(*index),
+                &d.required_obligations,
+                None,
+            )),
+            // No decision came back for this ephemeral id — e.g. two evaluations
+            // shared a resource.id and the PDP deduplicated them. Deny closed,
+            // but say so, otherwise it is indistinguishable from a policy deny.
+            None => {
+                log::warn!("authzen: no upstream decision for ephemeral id {eid}");
+                Some(deny_closed(
+                    rid,
+                    Some(*index),
+                    "no upstream decision for resource",
+                ))
+            }
         };
-        results[*index] = Some(authzen_decision(permit, rid, Some(*index), &obls, None));
     }
 }
 
@@ -416,6 +465,30 @@ fn semantic_of(body: &Value) -> &str {
         .and_then(|o| o.get("evaluations_semantic"))
         .and_then(Value::as_str)
         .unwrap_or("execute_all")
+}
+
+/// Read a decision out of a rendered AuthZEN evaluation. Structural, so it does
+/// not depend on `Value`'s `PartialEq<bool>` reading correctly at a glance.
+fn decision_of(v: &Value) -> Option<bool> {
+    v.get("decision").and_then(Value::as_bool)
+}
+
+/// Does *this group* carry a `want` decision? The short-circuit semantics must
+/// only consider groups that were actually evaluated: scanning all of `results`
+/// also sees entries pre-filled deny-closed before the loop, which would
+/// short-circuit on an unrelated index and discard upstream decisions.
+fn group_has(
+    results: &[Option<Value>],
+    items: &[(usize, String, Vec<String>)],
+    want: bool,
+) -> bool {
+    items.iter().any(|(i, _, _)| {
+        results
+            .get(*i)
+            .and_then(Option::as_ref)
+            .and_then(decision_of)
+            == Some(want)
+    })
 }
 
 fn fill_remaining_deny(results: &mut [Option<Value>], rid: &str, message: &str) {
@@ -524,9 +597,11 @@ async fn evaluations(
         Ok(v) => v,
         Err(e) => return pep_fail(e, &rid),
     };
-    let entries = match body.get("evaluations").and_then(Value::as_array) {
-        Some(arr) if !arr.is_empty() => arr.clone(),
-        _ => {
+    let entries = match body.get("evaluations") {
+        Some(Value::Array(arr)) if !arr.is_empty() => arr.clone(),
+        // Absent or empty: fall back to the top-level subject/action/resource as
+        // a documented single-evaluation alias.
+        Some(Value::Array(_)) | Some(Value::Null) | None => {
             if body.get("resource").is_some() {
                 vec![json!({})]
             } else {
@@ -535,6 +610,14 @@ async fn evaluations(
                     &rid,
                 );
             }
+        }
+        // Present but not an array: a miscoded batch, not a single evaluation.
+        Some(_) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "evaluations must be an array",
+                &rid,
+            )
         }
     };
     if entries.len() > MAX_EVALUATIONS {
@@ -622,17 +705,24 @@ async fn evaluations(
                 )
                 .await?;
                 let parsed_groups = parse_bulk_responses(&upstream);
+                // zip would silently truncate and drop the remaining groups into
+                // fill_remaining_deny, denying evaluations the PDP never ruled on
+                // with no error signal to the caller.
+                if parsed_groups.len() != groups.len() {
+                    log::warn!(
+                        "authzen GetDecisionBulk: {} decisionResponses for {} groups",
+                        parsed_groups.len(),
+                        groups.len()
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
                 for (g, parsed) in groups.iter().zip(parsed_groups.iter()) {
                     apply_decisions(&mut results, &g.items, parsed, &rid);
-                    if semantic == "deny_on_first_deny"
-                        && results.iter().flatten().any(|v| v["decision"] == false)
-                    {
+                    if semantic == "deny_on_first_deny" && group_has(&results, &g.items, false) {
                         fill_remaining_deny(&mut results, &rid, "deny_on_first_deny");
                         break;
                     }
-                    if semantic == "permit_on_first_permit"
-                        && results.iter().flatten().any(|v| v["decision"] == true)
-                    {
+                    if semantic == "permit_on_first_permit" && group_has(&results, &g.items, true) {
                         fill_remaining_deny(&mut results, &rid, "permit_on_first_permit");
                         break;
                     }

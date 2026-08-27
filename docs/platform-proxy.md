@@ -13,9 +13,10 @@ modern ZTDF rewrap (handled by platform).
 | `AUTHZ_PROXY` | `off` | `on` forwards `/authorization.v2.AuthorizationService/*` to platform. Independent of `KAS_PROXY_MODE` and of `AUTHZEN_FACADE`; requires `OPENTDF_PLATFORM_URL`. |
 | `AUTHZEN_FACADE` | `off` | `off` or `on` only. `on` serves AuthZEN 1.0 `/access/v1/evaluation`, `/access/v1/evaluations`, and `GET /.well-known/authzen-configuration`. Independent of `AUTHZ_PROXY`. Requires `OPENTDF_PLATFORM_URL`. There is no built-in evaluator. |
 | `OIDC_ISSUER` | `https://identity.arkavo.net` | Service-CWT `iss` pin when the facade is on. |
-| `AUTHZEN_COSE_KEYS_URL` | `{OIDC_ISSUER}/.well-known/cose-keys` | COSE_Key Set for PEP service-CWT verify (60s min refresh, 10s fetch). |
+| `AUTHZEN_COSE_KEYS_URL` | `{OIDC_ISSUER}/.well-known/cose-keys` | COSE_Key Set for PEP service-CWT verify (60s min refresh, 10s fetch, 5min max cache age, single-flight). |
 | `AUTHZEN_PEP_CLIENT_IDS` | unset | Optional comma-separated OAuth client ids. If set, other service CWTs get HTTP 403. If unset, any valid `service-account` CWT is accepted. |
-| `AUTHZEN_PUBLIC_URL` | unset | `policy_decision_point` identifier. If unset, derived from the request `Host` / `X-Forwarded-*`. |
+| `AUTHZEN_PUBLIC_URL` | unset | `policy_decision_point` identifier. **Set this in production.** If unset it falls back to the request `Host`; `X-Forwarded-Host`/`-Proto` are deliberately *not* trusted (no trusted-proxy config exists here, so honouring them would let a caller point every PEP that bootstraps from the discovery document at a PDP of their choosing). |
+| `AUTHZEN_EXPECTED_AUD` | unset | If set, a PEP service CWT's `aud` must contain this value in addition to its own client id. Without it, a service CWT minted for any other relying party of the same issuer authenticates here. |
 | `AUTHZEN_UPSTREAM_BEARER` | unset | Optional static bearer for facade→OpenTDF (tests / JWT exchange). Default: forward the verified PEP **service CWT**. |
 
 ## Modes

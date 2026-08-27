@@ -84,6 +84,7 @@ fn state_with_upstream(
         allowlist,
         Some("https://platform.arkavo.net".into()),
         upstream_bearer,
+        None,
     )
     .unwrap();
     (state, sk)
@@ -895,6 +896,7 @@ async fn key_set_fetch_failure_is_500() {
         None,
         Some("https://platform.arkavo.net".into()),
         None,
+        None,
     )
     .unwrap();
     let token = mint_service(&sk, "mcp-edge", false);
@@ -909,4 +911,194 @@ async fn key_set_fetch_failure_is_500() {
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// `deny_on_first_deny` must short-circuit on a deny produced by the groups it
+/// has actually evaluated — not on an entry that was pre-filled deny-closed
+/// before the loop ran. Scanning the whole results array lets an unrelated
+/// deny-closed entry at a later index discard a PERMIT the PDP returned.
+#[tokio::test]
+async fn deny_on_first_deny_must_not_discard_upstream_permits() {
+    let upstream = MockServer::start().await;
+    let both_permit = json!({
+        "decisionResponses": [
+            {"resourceDecisions": [{
+                "ephemeralResourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision": "DECISION_PERMIT", "requiredObligations": []}]},
+            {"resourceDecisions": [{
+                "ephemeralResourceId": "tdf-item-1",
+                "decision": "DECISION_PERMIT", "requiredObligations": []}]}
+        ]
+    });
+    Mock::given(method("POST"))
+        .and(path(
+            "/authorization.v2.AuthorizationService/GetDecisionBulk",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(both_permit))
+        .mount(&upstream)
+        .await;
+    let (st, sk) = state(&upstream.uri(), None);
+    let token = mint_service(&sk, "catalog-node", false);
+    let mut req: Value =
+        serde_json::from_str(include_str!("fixtures/bulk_evaluations_request.json")).unwrap();
+    req["options"] = json!({ "evaluations_semantic": "deny_on_first_deny" });
+    // index 2 is deny-closed before any upstream call (catalog_item, no fqns)
+    req["evaluations"].as_array_mut().unwrap().push(json!({
+        "action": { "name": "read" },
+        "resource": { "type": "catalog_item", "id": "cccccccccccccccccccccccccccccccc" }
+    }));
+    let app = facade::router(st);
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluations",
+        Some(&token),
+        Some(&req),
+        Some(RID),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["evaluations"][0]["decision"], json!(true));
+    assert_eq!(
+        body["evaluations"][1]["decision"],
+        json!(true),
+        "upstream PERMIT for group 1 must survive; a pre-filled deny-closed \
+         entry at index 2 must not short-circuit it"
+    );
+    assert_eq!(body["evaluations"][2]["decision"], json!(false));
+}
+
+/// A short upstream `decisionResponses` array must fail loudly, not silently
+/// deny-close the groups that `zip` dropped.
+#[tokio::test]
+async fn short_bulk_response_is_500_not_silent_deny() {
+    let upstream = MockServer::start().await;
+    let one_group_only = json!({
+        "decisionResponses": [
+            {"resourceDecisions": [{
+                "ephemeralResourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "decision": "DECISION_PERMIT", "requiredObligations": []}]}
+        ]
+    });
+    Mock::given(method("POST"))
+        .and(path(
+            "/authorization.v2.AuthorizationService/GetDecisionBulk",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(one_group_only))
+        .mount(&upstream)
+        .await;
+    let (st, sk) = state(&upstream.uri(), None);
+    let token = mint_service(&sk, "catalog-node", false);
+    let req: Value =
+        serde_json::from_str(include_str!("fixtures/bulk_evaluations_request.json")).unwrap();
+    let app = facade::router(st);
+    let (status, _, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluations",
+        Some(&token),
+        Some(&req),
+        Some(RID),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// `evaluations` present but not an array is a malformed batch, not a
+/// single-evaluation request in disguise.
+#[tokio::test]
+async fn non_array_evaluations_is_400() {
+    let upstream = MockServer::start().await;
+    let (st, sk) = state(&upstream.uri(), None);
+    let token = mint_service(&sk, "catalog-node", false);
+    let mut req: Value = catalog_req();
+    req["evaluations"] = json!({ "not": "an array" });
+    req["resource"] = json!({
+        "type": "catalog_item",
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "properties": { "attribute_value_fqns": ["https://patreon.arkavo.com/attr/tier/value/supporter"] }
+    });
+    req["action"] = json!({ "name": "read" });
+    let app = facade::router(st);
+    let (status, _, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluations",
+        Some(&token),
+        Some(&req),
+        Some(RID),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The discovery document tells PEPs where the PDP is. Deriving it from an
+/// attacker-controlled forwarding header points them at an attacker's PDP.
+#[tokio::test]
+async fn discovery_ignores_forwarded_host() {
+    let upstream = MockServer::start().await;
+    let (sk, vk) = keypair();
+    let _ = sk;
+    let keys = CoseKeyCache::with_static_keys(vec![(KID.to_vec(), vk)]);
+    // public_url unset: the header-derived fallback path
+    let st = FacadeState::new(
+        &upstream.uri(),
+        ISS.to_string(),
+        keys,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let app = facade::router(st);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/.well-known/authzen-configuration")
+        .header("host", "platform.arkavo.net")
+        .header("x-forwarded-host", "evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let raw = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    let pdp = body["policy_decision_point"].as_str().unwrap_or_default();
+    assert!(
+        !pdp.contains("evil.example"),
+        "policy_decision_point reflected x-forwarded-host: {pdp}"
+    );
+}
+
+/// A service CWT minted for a different relying party of the same issuer must
+/// not authenticate here once an expected audience is configured.
+#[tokio::test]
+async fn pep_token_without_expected_audience_is_401() {
+    let upstream = MockServer::start().await;
+    let (sk, vk) = keypair();
+    let keys = CoseKeyCache::with_static_keys(vec![(KID.to_vec(), vk)]);
+    let st = FacadeState::new(
+        &upstream.uri(),
+        ISS.to_string(),
+        keys,
+        None,
+        Some("https://platform.arkavo.net".into()),
+        None,
+        Some("https://platform.arkavo.net".into()),
+    )
+    .unwrap();
+    // aud = [client_id] only: passes the client_id check, lacks the platform aud
+    let token = mint_service(&sk, "catalog-node", false);
+    let app = facade::router(st);
+    let (status, _, _) = call(
+        app,
+        "POST",
+        "/access/v1/evaluations",
+        Some(&token),
+        Some(&catalog_req()),
+        Some(RID),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

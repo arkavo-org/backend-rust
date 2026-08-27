@@ -20,6 +20,13 @@ pub struct CoseKeyCache {
     cose_keys_url: Option<String>,
     http: reqwest::Client,
     cache: RwLock<KeyCache>,
+    /// A cached key older than this is re-fetched before use, so a rotated-out
+    /// or revoked kid stops verifying without waiting for a process restart.
+    max_age: Duration,
+    /// Serializes refreshes. `resolve` runs before any signature check, so
+    /// without this an unauthenticated caller sending unknown kids turns each
+    /// request into an outbound fetch against the identity service.
+    fetch_lock: tokio::sync::Mutex<()>,
 }
 
 fn bounded_http_client() -> reqwest::Client {
@@ -29,8 +36,14 @@ fn bounded_http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+const KEY_MAX_AGE: Duration = Duration::from_secs(300);
+
 impl CoseKeyCache {
     pub fn new(cose_keys_url: String) -> Self {
+        Self::with_max_age(cose_keys_url, KEY_MAX_AGE)
+    }
+
+    pub fn with_max_age(cose_keys_url: String, max_age: Duration) -> Self {
         Self {
             cose_keys_url: Some(cose_keys_url),
             http: bounded_http_client(),
@@ -38,6 +51,8 @@ impl CoseKeyCache {
                 keys: HashMap::new(),
                 last_fetch: None,
             }),
+            max_age,
+            fetch_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -50,19 +65,38 @@ impl CoseKeyCache {
                 keys: keys.into_iter().collect(),
                 last_fetch: None,
             }),
+            max_age: KEY_MAX_AGE,
+            fetch_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     pub async fn resolve(&self, kid: &[u8]) -> Result<VerifyingKey, VerifyError> {
-        if let Some(k) = self.lookup(kid).await {
+        if let Some(k) = self.fresh_lookup(kid).await {
             return Ok(k);
         }
         self.refresh_keys().await?;
         self.lookup(kid).await.ok_or(VerifyError::UnknownKid)
     }
 
+    /// The miss-throttle must never outlive `max_age`, or an expired set would
+    /// be served from cache anyway because the refresh it triggers is skipped.
+    fn refresh_throttle(&self) -> Duration {
+        KEY_REFRESH_MIN_INTERVAL.min(self.max_age)
+    }
+
     async fn lookup(&self, kid: &[u8]) -> Option<VerifyingKey> {
         self.cache.read().await.keys.get(kid).copied()
+    }
+
+    /// A hit only counts while the set it came from is younger than `max_age`.
+    async fn fresh_lookup(&self, kid: &[u8]) -> Option<VerifyingKey> {
+        let cache = self.cache.read().await;
+        let fresh = cache.last_fetch.is_some_and(|t| t.elapsed() < self.max_age);
+        if fresh {
+            cache.keys.get(kid).copied()
+        } else {
+            None
+        }
     }
 
     async fn refresh_keys(&self) -> Result<(), VerifyError> {
@@ -72,7 +106,18 @@ impl CoseKeyCache {
         {
             let cache = self.cache.read().await;
             if let Some(last) = cache.last_fetch {
-                if last.elapsed() < KEY_REFRESH_MIN_INTERVAL {
+                if last.elapsed() < self.refresh_throttle() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let _guard = self.fetch_lock.lock().await;
+        // Another task may have refreshed while we waited for the guard.
+        {
+            let cache = self.cache.read().await;
+            if let Some(last) = cache.last_fetch {
+                if last.elapsed() < self.refresh_throttle() {
                     return Ok(());
                 }
             }
@@ -180,6 +225,7 @@ fn p256_from_cose_key(key: &coset::CoseKey) -> Result<VerifyingKey, String> {
 mod tests {
     use super::*;
     use crate::modules::authzen::cwt_verify::test_support::keypair;
+    use std::sync::Arc;
 
     #[test]
     fn key_set_roundtrip() {
@@ -253,5 +299,98 @@ mod tests {
             VerifyError::KeySet
         );
         assert_eq!(cache.resolve(b"kid-1").await.unwrap(), vk);
+    }
+
+    fn key_set_bytes(kid: &[u8]) -> Vec<u8> {
+        let (_, vk) = keypair();
+        let point = vk.to_encoded_point(false);
+        let cose_key = coset::CoseKeyBuilder::new_ec2_pub_key(
+            coset::iana::EllipticCurve::P_256,
+            point.x().unwrap().to_vec(),
+            point.y().unwrap().to_vec(),
+        )
+        .algorithm(coset::iana::Algorithm::ES256)
+        .key_id(kid.to_vec())
+        .build();
+        let set = Value::Array(vec![cose_key.to_cbor_value().unwrap()]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&set, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// A cache hit must not be served forever: once the entry is older than the
+    /// max age the set is re-fetched, so a rotated-out kid stops verifying
+    /// without waiting for a process restart.
+    #[tokio::test]
+    async fn expired_cache_drops_a_rotated_out_kid() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/cose-keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(key_set_bytes(b"kid-1")))
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/cose-keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(key_set_bytes(b"kid-2")))
+            .mount(&upstream)
+            .await;
+
+        let cache = CoseKeyCache::with_max_age(
+            format!("{}/.well-known/cose-keys", upstream.uri()),
+            Duration::from_secs(0),
+        );
+        assert!(cache.resolve(b"kid-1").await.is_ok());
+        assert_eq!(
+            cache.resolve(b"kid-1").await.unwrap_err(),
+            VerifyError::UnknownKid,
+            "a kid removed from the published set must stop resolving"
+        );
+    }
+
+    /// Concurrent misses must collapse into one outbound fetch. The lookup is
+    /// reachable before any signature check, so one fetch per request would let
+    /// an unauthenticated caller amplify against the identity service.
+    #[tokio::test]
+    async fn concurrent_misses_collapse_into_one_fetch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/cose-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(key_set_bytes(b"kid-1"))
+                    .set_delay(Duration::from_millis(150)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let cache = Arc::new(CoseKeyCache::new(format!(
+            "{}/.well-known/cose-keys",
+            upstream.uri()
+        )));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let kid = format!("unknown-{i}");
+                c.resolve(kid.as_bytes()).await
+            }));
+        }
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+        let got = upstream.received_requests().await.unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "8 concurrent misses issued {} fetches; expected single-flight",
+            got.len()
+        );
     }
 }
