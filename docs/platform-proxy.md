@@ -26,17 +26,28 @@ Whenever the mode is anything other than `off`, `/.well-known/opentdf-configurat
 ## KAS URL identity caveat
 
 The platform validates that the `kas_url` claim in a rewrap request matches its
-`RegisteredKASURI` (see `service/kas/kas.go` in the platform repo). If you run
-arks at `https://platform.arkavo.net` but TDFs were minted against
-`https://platform.svc`, the URL still points at platform — so direct hits or
-proxying both work.
+`RegisteredKASURI` (see `service/kas/kas.go` in the platform repo). That claim
+sits inside the signed rewrap envelope, so arks cannot rewrite it while
+proxying — rewriting would require re-signing with a key the platform trusts,
+which is not supported.
 
-If you want clients to mint TDFs against `platform.arkavo.net` and have arks proxy
-them through, you must either:
+In production this is already consistent and needs no action: arks serves
+`https://platform.arkavo.net`, and the co-located platform registers
+`registered_kas_uri: https://platform.arkavo.net`. Clients mint against the
+same name they dial.
 
-1. Register `https://platform.arkavo.net` as platform's `RegisteredKASURI`, or
-2. Rewrite the `kas_url` field inside the signed rewrap request envelope — not
-   currently supported; would require JWT re-signing with a key platform trusts.
+The caveat matters only if the two ever diverge. If you point arks at an
+upstream whose `RegisteredKASURI` is a different name (say `https://platform.svc`),
+then TDFs must be minted against **that** name, not against the arks hostname —
+otherwise the platform rejects the rewrap. Keep `registered_kas_uri` and the
+public arks hostname equal unless you have a specific reason not to.
+
+Note the value is the bare origin — `https://platform.arkavo.net`, with no
+`/kas` path. A TDF minted with `.../kas` in `keyAccess[].url` carries a
+`kas_url` that is not string-equal to the registered value and is denied.
+
+See `docs/hostname-policy.md` for why `platform.arkavo.net` is the only
+published production name.
 
 ## Authorization service forwarding
 

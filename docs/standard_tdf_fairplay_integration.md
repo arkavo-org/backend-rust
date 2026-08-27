@@ -68,7 +68,7 @@ movie.tdf (ZIP archive)
     "keyAccess": [
       {
         "type": "wrapped",
-        "url": "https://platform.arkavo.net/kas",
+        "url": "https://platform.arkavo.net",
         "protocol": "kas",
         "wrappedKey": "BASE64_RSA_OAEP_ENCRYPTED_DEK",
         "policyBinding": {
@@ -116,8 +116,8 @@ openssl rand -hex 16 > content_key.txt
 ### 2. Get KAS RSA Public Key
 
 ```bash
-curl -s https://platform.arkavo.net/kas/v2/kas_public_key?algorithm=rsa \
-  | jq -r '.publicKey' > kas_rsa_public.pem
+curl -s "https://platform.arkavo.net/kas/v2/kas_public_key?algorithm=rsa" \
+  | jq -r '.public_key' > kas_rsa_public.pem
 ```
 
 ### 3. Wrap DEK with RSA-OAEP
@@ -132,7 +132,8 @@ openssl pkeyutl -encrypt -pubin -inkey kas_rsa_public.pem \
   -in content_key.bin -out wrapped_key.bin
 
 # Base64 encode for manifest
-base64 < wrapped_key.bin > wrapped_key.b64
+# -A / -w0: GNU base64 wraps at 76 cols, which corrupts the manifest field
+openssl base64 -A < wrapped_key.bin > wrapped_key.b64
 ```
 
 ### 4. Encrypt HLS Segments
@@ -154,7 +155,7 @@ manifest = {
         "type": "split",
         "keyAccess": [{
             "type": "wrapped",
-            "url": "https://platform.arkavo.net/kas",
+            "url": "https://platform.arkavo.net",
             "protocol": "kas",
             "wrappedKey": open("wrapped_key.b64").read().strip()
         }],
@@ -177,6 +178,13 @@ with open("manifest.json", "w") as f:
 ## Playback Key Delivery Flow
 
 ### 1. Start Playback Session
+
+> **These examples run against production and `/media/v1/*` currently takes no
+> caller authentication** — `session_start` and `media_key_request` accept a
+> caller-supplied `userId`/`assetId` with no `Authorization` extractor, and
+> `/media/v1/*` is always served locally (never proxied). Treat the session id
+> as a bearer secret, and do not expose these routes to untrusted networks
+> until an auth extractor is added.
 
 ```bash
 curl -X POST https://platform.arkavo.net/media/v1/session/start \
@@ -352,7 +360,8 @@ GET /kas/v2/kas_public_key?algorithm=rsa
 Response:
 ```json
 {
-  "publicKey": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  "public_key": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----",
+  "kid": "r1"
 }
 ```
 
