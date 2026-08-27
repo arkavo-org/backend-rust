@@ -124,7 +124,7 @@ AUTHZEN_PUBLIC_URL=https://platform.arkavo.net
 AUTHZEN_EXPECTED_AUD=https://platform.arkavo.net
 # AUTHZEN_COSE_KEYS_URL defaults to ${OIDC_ISSUER}/.well-known/cose-keys
 # AUTHZEN_UPSTREAM_BEARER stays unset — the facade forwards the PEP service CWT
-# AUTHZEN_PEP_CLIENT_IDS stays unset until catalog-node / mcp-edge are minted
+AUTHZEN_PEP_CLIENT_IDS=catalog-node,mcp-edge
 ```
 
 `:8181` is the co-located platform. **`:8443` on this box is Docker, not the
@@ -155,11 +155,17 @@ unmoved.
 | `/ws` HTTP/2 + Upgrade | 400 (unchanged) |
 | `/kas.AccessService/Rewrap`, `/kas/v2/rewrap` | 401 / 422 — alive, unmoved |
 
-Not yet exercised: a production-signed service CWT returning a decision. That
-needs a `catalog-node` / `mcp-edge` client minted at `identity.arkavo.net` with
-`sub = client:{id}`, `arkavo_roles` containing `service-account`, and `aud`
-covering both the client id and `https://platform.arkavo.net`. Until those land,
-live AuthZEN traffic is only the probes above.
+Production-signed service CWTs (2026-08-27, minted on identity, evaluated here):
+
+| Check | Result |
+|-------|--------|
+| `catalog-node` CWT → `/access/v1/evaluation` | 200, `decision: false` (deny for all-zeros probe subject) |
+| `mcp-edge` CWT | 200 |
+| any other valid `service-account` CWT (`opentdf`) | **403** `pep client not allowlisted` |
+
+`AUTHZEN_PEP_CLIENT_IDS=catalog-node,mcp-edge` is set. Catalog still uses
+`AUTHZ_PROXY` until tdf-iroh-s3 cuts over; live AuthZEN traffic is still
+probes only.
 
 The Connect caller credential is a **CWT** (`arkavo-org/opentdf-platform`, not
 upstream JWT). PEPs send a service CWT — do not put a JWT mint/exchange in front.
