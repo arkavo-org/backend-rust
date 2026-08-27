@@ -35,7 +35,7 @@ certificate carries a single SAN, so any client still dialing them fails at DNS
 | `POST /kas.AccessService/Rewrap` | 401 on empty body (route live, proxied to platform) |
 | `GET /media/v1/certificate` | 200 |
 | `GET /.well-known/apple-app-site-association` | 200 |
-| `GET /.well-known/authzen-configuration` | 404 (facade not implemented; see below) |
+| `GET /.well-known/authzen-configuration` | 200 — facade enabled 2026-08-27; see below |
 | `GET /ws` HTTP/1.1 + `Upgrade` | **101 Switching Protocols** |
 | `GET /ws` HTTP/2 + `Upgrade` | **400** (expected — see below) |
 
@@ -108,23 +108,58 @@ A `/ws` upgrade attempted over H3 degrades benignly to a 4xx. See
 - The NanoTDF `/ws` protocol. No AuthZEN on that path.
 - Ohio `3.15.26.24` — decommissioned, do not revive.
 
-## Pending: AuthZEN facade
+## AuthZEN facade
 
-Not required for the hostname cutover. `AUTHZEN_FACADE` **is not implemented in
-this codebase yet** (no references in `src/`; PR #65 is not merged — `main` is at
-`e9e3499`). The current `404` on
-`/.well-known/authzen-configuration` is therefore expected, not a
-misconfiguration.
+**Live since 2026-08-27** (`AUTHZEN_FACADE=on`, arks built from `4922a88`).
+`GET /.well-known/authzen-configuration` returns 200; the 404 in older revisions
+of this document predates PR #65.
 
-When #65 lands, enable with:
+Deployed configuration on this host:
 
 ```sh
 AUTHZEN_FACADE=on
-OPENTDF_PLATFORM_URL=http://127.0.0.1:8181   # co-located platform on this host
+OPENTDF_PLATFORM_URL=http://127.0.0.1:8181   # co-located platform, loopback only
+OIDC_ISSUER=https://identity.arkavo.net
+AUTHZEN_PUBLIC_URL=https://platform.arkavo.net
+AUTHZEN_EXPECTED_AUD=https://platform.arkavo.net
+# AUTHZEN_COSE_KEYS_URL defaults to ${OIDC_ISSUER}/.well-known/cose-keys
+# AUTHZEN_UPSTREAM_BEARER stays unset — the facade forwards the PEP service CWT
+# AUTHZEN_PEP_CLIENT_IDS stays unset until catalog-node / mcp-edge are minted
 ```
 
-Then `GET https://platform.arkavo.net/.well-known/authzen-configuration` should
-return JSON with `policy_decision_point = https://platform.arkavo.net`.
+`:8181` is the co-located platform. **`:8443` on this box is Docker, not the
+platform** — pointing `OPENTDF_PLATFORM_URL` there is the usual cause of a 500
+from discovery. An upstream failure surfaces as 500, never 502.
+
+`AUTHZEN_PUBLIC_URL` must stay set. With it unset the discovery document is
+derived from the request `Host` (forwarded headers are deliberately not
+trusted), which is client-supplied — and that document is what PEPs bootstrap
+from.
+
+Enabling the facade does **not** migrate
+`/authorization.v2.AuthorizationService/*`; catalog keeps using `AUTHZ_PROXY`
+until its PEP cuts over. It does not touch `/ws` either — NanoTDF rewrap is
+unmoved.
+
+### Verified on enable (2026-08-27)
+
+| Check | Result |
+|-------|--------|
+| Discovery | exactly 3 keys; `policy_decision_point`, `access_evaluation_endpoint`, `access_evaluations_endpoint` all correct; no `search_*`, no `signed_metadata` |
+| Discovery vs `x-forwarded-host: evil.example` | stays `https://platform.arkavo.net` |
+| Discovery vs spoofed `Host` | stays `https://platform.arkavo.net` |
+| No / empty / garbage Bearer | 401 |
+| Compact JWT as Bearer | 401 |
+| Well-formed tag-61 CWT, non-IdP kid | 401 |
+| `/ws` HTTP/1.1 + Upgrade | 101 (unchanged) |
+| `/ws` HTTP/2 + Upgrade | 400 (unchanged) |
+| `/kas.AccessService/Rewrap`, `/kas/v2/rewrap` | 401 / 422 — alive, unmoved |
+
+Not yet exercised: a production-signed service CWT returning a decision. That
+needs a `catalog-node` / `mcp-edge` client minted at `identity.arkavo.net` with
+`sub = client:{id}`, `arkavo_roles` containing `service-account`, and `aud`
+covering both the client id and `https://platform.arkavo.net`. Until those land,
+live AuthZEN traffic is only the probes above.
 
 The Connect caller credential is a **CWT** (`arkavo-org/opentdf-platform`, not
 upstream JWT). PEPs send a service CWT — do not put a JWT mint/exchange in front.
