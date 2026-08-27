@@ -9,7 +9,7 @@ use crate::modules::authzen::cwt_subject::{Aud, DecodedClaims};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ciborium::value::Value;
-use coset::{CborSerializable, CoseSign1};
+use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use std::collections::HashSet;
@@ -61,7 +61,7 @@ pub fn verify_tagged_bytes(
     let inner = bytes
         .strip_prefix(&CWT_TAG_PREFIX)
         .ok_or(VerifyError::Malformed)?;
-    let sign1 = CoseSign1::from_slice(inner).map_err(|_| VerifyError::Malformed)?;
+    let sign1 = parse_sign1(inner)?;
     match sign1.protected.header.alg {
         Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
         _ => return Err(VerifyError::UnsupportedAlg),
@@ -82,6 +82,13 @@ pub fn verify_tagged_bytes(
     sign1
         .verify_signature(b"", |sig, data| {
             let sig = Signature::from_slice(sig).map_err(|_| ())?;
+            // Deliberately accept both low-S and high-S. ECDSA does not mandate
+            // low-S (that is a BIP-62 convention) and the RustCrypto signer does
+            // not normalize, so rejecting high-S would reject tokens this repo's
+            // own minter produces. The consequence is that a token is malleable
+            // into a byte-distinct form with identical claims, so replay and
+            // dedup MUST key on `cti` (required non-empty above), never on the
+            // token string or its hash.
             key.verify(data, &sig).map_err(|_| ())
         })
         .map_err(|_| VerifyError::Signature)?;
@@ -167,7 +174,10 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
                     exp = numeric_date(v);
                 }
                 (5, ref v) => {
-                    nbf = numeric_date(v);
+                    // Present-but-unparseable must fail closed. exp/iat get this
+                    // for free via ok_or below; nbf is an Option, so without an
+                    // explicit check a Text/Tag nbf would skip enforcement.
+                    nbf = Some(numeric_date(v).ok_or(VerifyError::Malformed)?);
                 }
                 (6, ref v) => {
                     iat = numeric_date(v);
@@ -195,14 +205,27 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
             _ => {}
         }
     }
+    // Presence is not enough: an empty cti collapses every token onto one
+    // replay identifier, and an empty sub yields a subject id of "".
+    let non_empty_str = |v: Option<String>, name: &'static str| {
+        v.filter(|s| !s.is_empty())
+            .ok_or(VerifyError::MissingClaim(name))
+    };
     Ok(DecodedClaims {
-        iss: iss.ok_or(VerifyError::MissingClaim("iss"))?,
-        sub: sub.ok_or(VerifyError::MissingClaim("sub"))?,
-        aud: aud.ok_or(VerifyError::MissingClaim("aud"))?,
+        iss: non_empty_str(iss, "iss")?,
+        sub: non_empty_str(sub, "sub")?,
+        aud: aud
+            .filter(|a| match a {
+                Aud::One(s) => !s.is_empty(),
+                Aud::Many(v) => !v.is_empty() && v.iter().all(|s| !s.is_empty()),
+            })
+            .ok_or(VerifyError::MissingClaim("aud"))?,
         exp: exp.ok_or(VerifyError::MissingClaim("exp"))?,
         nbf,
         iat: iat.ok_or(VerifyError::MissingClaim("iat"))?,
-        cti: cti.ok_or(VerifyError::MissingClaim("cti"))?,
+        cti: cti
+            .filter(|c| !c.is_empty())
+            .ok_or(VerifyError::MissingClaim("cti"))?,
         email,
         email_verified,
         idp,
@@ -212,6 +235,16 @@ fn parse_claims(payload: &[u8]) -> Result<DecodedClaims, VerifyError> {
         client_id,
         arkavo_patreon,
     })
+}
+
+/// The CWT tag may wrap either a bare COSE_Sign1 array or a tagged one —
+/// RFC 8392 6 permits `61(18([...]))`. coset's `from_slice` accepts only the
+/// bare form, so an issuer that tags the inner message would otherwise be
+/// rejected as `Malformed` with no hint as to why.
+fn parse_sign1(inner: &[u8]) -> Result<CoseSign1, VerifyError> {
+    CoseSign1::from_slice(inner)
+        .or_else(|_| CoseSign1::from_tagged_slice(inner))
+        .map_err(|_| VerifyError::Malformed)
 }
 
 /// RFC 8392 NumericDate: a CBOR integer or float. Fractional seconds truncate.
@@ -713,5 +746,86 @@ mod tests {
         let claims = verify_header_token(&t, &vk, opts()).expect("float value is valid");
         let p = claims.arkavo_patreon.expect("patreon present");
         assert_eq!(p["verified_at"].as_f64(), Some(1779996400.5));
+    }
+
+    #[test]
+    fn reject_nbf_of_wrong_type() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e.push((Value::Integer(5.into()), Value::Text("1900086400".into())));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(
+            verify_header_token(&t, &vk, opts()).is_err(),
+            "a present-but-unparseable nbf must fail closed, not be ignored"
+        );
+    }
+
+    #[test]
+    fn reject_empty_cti() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e[5] = (Value::Integer(7.into()), Value::Bytes(Vec::new()));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::MissingClaim("cti"))
+        ));
+    }
+
+    #[test]
+    fn reject_empty_sub() {
+        let (sk, vk) = keypair();
+        let mut e = base_entries();
+        e[1] = (Value::Integer(2.into()), Value::Text(String::new()));
+        let t = super::test_support::mint_with_protected(&sk, es256_header(), e);
+        assert!(matches!(
+            verify_header_token(&t, &vk, opts()),
+            Err(VerifyError::MissingClaim("sub"))
+        ));
+    }
+
+    /// A malleated (high-S) token still verifies — see the comment in
+    /// `verify_tagged_bytes`. This pins the property that makes that safe:
+    /// the claims, and therefore `cti`, are identical, so cti-keyed replay
+    /// detection is unaffected by the malleation.
+    #[test]
+    fn malleated_signature_yields_the_same_cti() {
+        use p256::ecdsa::Signature;
+        let (sk, vk) = keypair();
+        let t = token(&sk);
+        let raw = URL_SAFE_NO_PAD.decode(&t).unwrap();
+        let inner = raw.strip_prefix(&CWT_TAG_PREFIX).unwrap();
+        let mut sign1 = CoseSign1::from_slice(inner).unwrap();
+        let sig = Signature::from_slice(&sign1.signature).unwrap();
+        let flipped = match sig.normalize_s() {
+            Some(low) => low,
+            None => Signature::from_scalars(sig.r().to_owned(), -sig.s()).unwrap(),
+        };
+        sign1.signature = flipped.to_bytes().to_vec();
+        let mut out = CWT_TAG_PREFIX.to_vec();
+        out.extend_from_slice(&sign1.to_vec().unwrap());
+        let malleated = URL_SAFE_NO_PAD.encode(out);
+        assert_ne!(malleated, t, "malleation must produce a distinct token");
+        let a = verify_header_token(&t, &vk, opts()).unwrap();
+        let b = verify_header_token(&malleated, &vk, opts()).unwrap();
+        assert_eq!(a.cti, b.cti);
+    }
+
+    /// RFC 8392 6: the CWT tag may wrap a *tagged* COSE_Sign1, i.e. 61(18([...])).
+    #[test]
+    fn accept_tagged_inner_cose_sign1() {
+        let (sk, vk) = keypair();
+        let t = token(&sk);
+        let raw = URL_SAFE_NO_PAD.decode(&t).unwrap();
+        let inner = raw.strip_prefix(&CWT_TAG_PREFIX).unwrap();
+        use coset::TaggedCborSerializable;
+        let sign1 = CoseSign1::from_slice(inner).unwrap();
+        let mut out = CWT_TAG_PREFIX.to_vec();
+        out.extend_from_slice(&sign1.to_tagged_vec().unwrap());
+        let tagged = URL_SAFE_NO_PAD.encode(out);
+        assert_ne!(tagged, t);
+        let claims = verify_header_token(&tagged, &vk, opts())
+            .expect("61(18(COSE_Sign1)) is RFC 8392 legal");
+        assert_eq!(claims.sub, "arkavo:u1");
     }
 }
