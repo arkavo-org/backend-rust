@@ -1,0 +1,17 @@
+{
+  "subject": {
+    "type": "identity",
+    "id": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+    "properties": {
+      "iss": "https://identity.arkavo.net",
+      "idp": "arkavo",
+      "arkavo_roles": ["user"]
+    }
+  },
+  "action": { "name": "tools/call" },
+  "resource": { "type": "tool", "id": "git_commit" },
+  "context": {
+    "agent": "https://mcp.arkavo.net",
+    "pep": { "fulfillable_obligation_fqns": [] }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "decision": {
+    "ephemeralResourceId": "git_commit",
+    "decision": "DECISION_PERMIT",
+    "requiredObligations": ["https://arkavo.net/obl/watermark"]
+  }
+}

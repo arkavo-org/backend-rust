@@ -1,0 +1,22 @@
+{
+  "decisionResponses": [
+    {
+      "resourceDecisions": [
+        {
+          "ephemeralResourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "decision": "DECISION_PERMIT",
+          "requiredObligations": []
+        }
+      ]
+    },
+    {
+      "resourceDecisions": [
+        {
+          "ephemeralResourceId": "tdf-item-1",
+          "decision": "DECISION_DENY",
+          "requiredObligations": []
+        }
+      ]
+    }
+  ]
+}

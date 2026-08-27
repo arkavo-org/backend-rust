@@ -1,0 +1,35 @@
+{
+  "subject": {
+    "type": "identity",
+    "id": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+    "properties": {
+      "iss": "https://identity.arkavo.net"
+    }
+  },
+  "evaluations": [
+    {
+      "action": { "name": "read" },
+      "resource": {
+        "type": "catalog_item",
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "properties": {
+          "attribute_value_fqns": [
+            "https://patreon.arkavo.com/attr/tier/value/supporter"
+          ]
+        }
+      }
+    },
+    {
+      "action": { "name": "decrypt" },
+      "resource": {
+        "type": "tdf",
+        "id": "tdf-item-1",
+        "properties": {
+          "attribute_value_fqns": [
+            "https://patreon.arkavo.com/attr/tier/value/supporter"
+          ]
+        }
+      }
+    }
+  ]
+}

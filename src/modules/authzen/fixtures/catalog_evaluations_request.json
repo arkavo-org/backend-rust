@@ -1,0 +1,71 @@
+{
+  "subject": {
+    "type": "identity",
+    "id": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+    "properties": {
+      "iss": "https://identity.arkavo.net",
+      "idp": "arkavo",
+      "email": "alice@example.com",
+      "email_verified": true,
+      "arkavo_account_id": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+      "arkavo_roles": ["user"],
+      "arkavo_entitlements": ["tdf:decrypt"],
+      "arkavo_patreon": {
+        "role": "consumer",
+        "patreon_user_id": "12345678",
+        "memberships": [
+          {
+            "campaign_id": "87654321",
+            "patron_status": "active_patron",
+            "tier_ids": ["111"],
+            "tier_slugs": ["supporter"]
+          }
+        ],
+        "verified_at": 1779996400,
+        "cache_expires_at": 1780000000
+      }
+    }
+  },
+  "action": { "name": "read" },
+  "context": {
+    "device": {
+      "sub": "550e8400-e29b-41d4-a716-446655440000",
+      "iss": "https://identity.arkavo.net",
+      "aud": "arkavo:devicecheck",
+      "kid": "YWxwaGEtZGV2aWNlLWtpZA"
+    },
+    "environment": {
+      "region": "us-east-1"
+    },
+    "pep": {
+      "fulfillable_obligation_fqns": []
+    }
+  },
+  "evaluations": [
+    {
+      "resource": {
+        "type": "catalog_item",
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "properties": {
+          "attribute_value_fqns": [
+            "https://patreon.arkavo.com/attr/campaign/value/87654321",
+            "https://patreon.arkavo.com/attr/tier/value/supporter"
+          ]
+        }
+      }
+    },
+    {
+      "resource": {
+        "type": "catalog_item",
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "properties": {
+          "attribute_value_fqns": [
+            "https://patreon.arkavo.com/attr/campaign/value/87654321",
+            "https://patreon.arkavo.com/attr/tier/value/gold"
+          ]
+        }
+      }
+    }
+  ],
+  "options": { "evaluations_semantic": "execute_all" }
+}

@@ -1,0 +1,15 @@
+{
+  "allPermitted": false,
+  "resourceDecisions": [
+    {
+      "ephemeralResourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decision": "DECISION_PERMIT",
+      "requiredObligations": []
+    },
+    {
+      "ephemeralResourceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "decision": "DECISION_DENY",
+      "requiredObligations": []
+    }
+  ]
+}

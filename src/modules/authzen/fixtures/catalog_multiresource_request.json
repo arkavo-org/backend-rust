@@ -1,0 +1,79 @@
+{
+  "entityIdentifier": {
+    "entityChain": {
+      "ephemeralId": "chain",
+      "entities": [
+        {
+          "ephemeralId": "e0",
+          "category": "CATEGORY_SUBJECT",
+          "claims": {
+            "@type": "type.googleapis.com/google.protobuf.Struct",
+            "value": {
+              "sub": "arkavo:550e8400-e29b-41d4-a716-446655440000",
+              "iss": "https://identity.arkavo.net",
+              "email": "alice@example.com",
+              "patreon_user_id": "12345678",
+              "arkavo_patreon": {
+                "role": "consumer",
+                "patreon_user_id": "12345678",
+                "memberships": [
+                  {
+                    "campaign_id": "87654321",
+                    "patron_status": "active_patron",
+                    "tier_ids": ["111"],
+                    "tier_slugs": ["supporter"]
+                  }
+                ],
+                "verified_at": 1779996400,
+                "cache_expires_at": 1780000000
+              }
+            }
+          }
+        },
+        {
+          "ephemeralId": "e1",
+          "category": "CATEGORY_ENVIRONMENT",
+          "claims": {
+            "@type": "type.googleapis.com/google.protobuf.Struct",
+            "value": {
+              "sub": "550e8400-e29b-41d4-a716-446655440000",
+              "iss": "https://identity.arkavo.net",
+              "aud": "arkavo:devicecheck",
+              "kid": "YWxwaGEtZGV2aWNlLWtpZA"
+            }
+          }
+        },
+        {
+          "ephemeralId": "e2",
+          "category": "CATEGORY_ENVIRONMENT",
+          "claims": {
+            "@type": "type.googleapis.com/google.protobuf.Struct",
+            "value": { "region": "us-east-1" }
+          }
+        }
+      ]
+    }
+  },
+  "action": { "name": "read" },
+  "resources": [
+    {
+      "ephemeralId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "attributeValues": {
+        "fqns": [
+          "https://patreon.arkavo.com/attr/campaign/value/87654321",
+          "https://patreon.arkavo.com/attr/tier/value/supporter"
+        ]
+      }
+    },
+    {
+      "ephemeralId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "attributeValues": {
+        "fqns": [
+          "https://patreon.arkavo.com/attr/campaign/value/87654321",
+          "https://patreon.arkavo.com/attr/tier/value/gold"
+        ]
+      }
+    }
+  ],
+  "fulfillableObligationFqns": []
+}

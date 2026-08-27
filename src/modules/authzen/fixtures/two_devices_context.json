@@ -1,0 +1,19 @@
+{
+  "devices": [
+    {
+      "sub": "550e8400-e29b-41d4-a716-446655440000",
+      "iss": "https://identity.arkavo.net",
+      "aud": "arkavo:devicecheck",
+      "kid": "cGhvbmUta2lk"
+    },
+    {
+      "sub": "550e8400-e29b-41d4-a716-446655440000",
+      "iss": "https://identity.arkavo.net",
+      "aud": "arkavo:devicecheck",
+      "kid": "d2F0Y2gta2lk"
+    }
+  ],
+  "environment": {
+    "region": "us-east-1"
+  }
+}
