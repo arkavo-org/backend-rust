@@ -96,8 +96,10 @@ server is built with `--features c2pa_signing`) both `POST /c2pa/v1/sign` and
 caller supplies with the server's C2PA key, so leaving it ungated would make it an
 unauthenticated signing oracle.
 
-The list above is the surface gated by the shared `require_cwt` middleware. Two
-optional, off-by-default features add routes outside that middleware:
+The list above is the surface gated by the shared `require_cwt` middleware —
+`/ws` included: the WebSocket upgrade runs the same middleware as the HTTP
+routes, so the `X-Actor-Token` rule below applies to the NanoTDF KAS path too.
+Two optional, off-by-default features add routes outside that middleware:
 
 - **Pass-through proxying** (`KAS_PROXY_MODE=rest|connect|both`, `AUTHZ_PROXY=on`):
   the forwarded routes (`/kas/v2/rewrap` and `/kas/v2/kas_public_key` under `rest`,
@@ -144,9 +146,8 @@ captured `signed_request_token` cannot be replayed with a substituted key.
 
 ### Failure responses
 
-For the routes gated by the shared `require_cwt` middleware (rewrap, media,
-c2pa) and for the `/ws` handler's own equivalent bearer check, all
-authentication failures (missing bearer, invalid CWT, invalid or unauthorized
+For the routes gated by the shared `require_cwt` middleware (`/ws`, rewrap,
+media, c2pa), all authentication failures (missing bearer, invalid CWT, invalid or unauthorized
 `X-Actor-Token`) return `401 Unauthorized` with a plain-text body such as
 `Missing Bearer CWT`, `Invalid CWT`, or `Actor not authorized for this token` —
 not a JSON error envelope.
@@ -478,7 +479,7 @@ S→C: [0xFF]{"error_type":"invalid_format","message":"Session not established -
 | CWT_KEYS_URL | https://identity.arkavo.net/.well-known/cose-keys | COSE key set URL for CWT signature verification (gates every non-public route, not only `/ws`) |
 | CWT_EXPECTED_ISSUER | https://identity.arkavo.net | Required CWT `iss` claim |
 | CWT_EXPECTED_AUDIENCE | https://100.arkavo.net | Required CWT `aud` claim |
-| ARKS_SERVICE_CWT_PATH | - | Optional. Path to a file containing this service's own CWT, relayed as `X-Actor-Token` when arks proxies a request to the upstream OpenTDF platform. Read once at startup; an unreadable file or a value that isn't a valid HTTP header fails startup, not per-request. |
+| ARKS_SERVICE_CWT_PATH | - | **Required whenever a proxy route is mounted** (`KAS_PROXY_MODE` != `off`, or `AUTHZ_PROXY=on`); startup fails with a message naming the variable if it is unset. Path to a file containing this service's own CWT, relayed as `X-Actor-Token` on every forwarded request so the upstream platform can check it against the caller bearer's `act[]`. Read once at startup — an unreadable file or a value that isn't a valid HTTP header value fails startup, not per-request. To run without an actor token, set `KAS_PROXY_MODE=off` and leave `AUTHZ_PROXY` unset. |
 | NATS_URL | nats://localhost:4222 | NATS server URL |
 | NATS_SUBJECT | nanotdf.messages | Default NATS subscription subject |
 | REDIS_URL | redis://localhost:6379 | Redis connection string |

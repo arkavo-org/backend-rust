@@ -168,7 +168,7 @@ pub fn router(state: Arc<MediaApiState>, auth: Arc<CwtAuthState>) -> Router {
             post(session_heartbeat),
         )
         .route("/media/v1/session/:session_id", delete(session_terminate))
-        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .route_layer(axum::middleware::from_fn_with_state(auth, require_cwt))
         .with_state(state.clone());
 
     let public = Router::new()

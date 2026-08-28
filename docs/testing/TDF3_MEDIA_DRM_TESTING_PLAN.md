@@ -48,8 +48,12 @@ export SESSION_HEARTBEAT_TIMEOUT=300  # 5 minutes
 export TLS_CERT_PATH=fullchain.pem
 export TLS_KEY_PATH=privkey.pem
 
-# Optional: OAuth JWT validation
-export OAUTH_PUBLIC_KEY_PATH=oauth_public.pem
+# CWT bearer authentication (defaults shown). Every route except
+# GET /media/v1/certificate requires `Authorization: Bearer <CWT>`;
+# the check cannot be disabled.
+export CWT_KEYS_URL=https://identity.arkavo.net/.well-known/cose-keys
+export CWT_EXPECTED_ISSUER=https://identity.arkavo.net
+export CWT_EXPECTED_AUDIENCE=https://100.arkavo.net
 ```
 
 ### Start Services

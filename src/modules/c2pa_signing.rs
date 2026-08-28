@@ -196,7 +196,7 @@ pub fn router(state: Arc<C2paSigningState>, auth: Arc<CwtAuthState>) -> Router {
     Router::new()
         .route("/c2pa/v1/sign", post(sign_manifest))
         .route("/c2pa/v1/validate", post(validate_manifest))
-        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .route_layer(axum::middleware::from_fn_with_state(auth, require_cwt))
         .with_state(state)
 }
 
@@ -1063,5 +1063,26 @@ mod route_tests {
             .unwrap();
         assert_eq!(r.status(), 401);
         assert_eq!(r.text().await.unwrap(), "Invalid CWT");
+    }
+
+    // The gate must apply to the routes this builder declares, not to the
+    // router's catch-all fallback. `router()` has no public half to merge a
+    // clean fallback back in from, and `main.rs` merges it last, so a
+    // fallback-wrapping `.layer()` turns every unmatched path on the whole
+    // server into 401 "Missing Bearer CWT" instead of 404. `.route_layer()`
+    // applies to matched routes only, which is what is wanted.
+    #[tokio::test]
+    async fn unmatched_path_is_404_not_401() {
+        let (base, _mock) = spawn().await;
+        let r = reqwest::Client::new()
+            .get(format!("{base}/c2pa/v1/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            404,
+            "unmatched paths must fall through to 404, not be swallowed by the auth layer"
+        );
     }
 }

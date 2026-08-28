@@ -18,7 +18,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use log::warn;
+use log::{debug, warn};
 use std::sync::Arc;
 
 pub const ACTOR_TOKEN_HEADER: &str = "x-actor-token";
@@ -64,6 +64,13 @@ pub async fn require_cwt(
             return unauthorized("Invalid CWT");
         }
     };
+    // Debug, not info: this runs on every gated request. It is the only
+    // place the verified `iss`/`aud` are surfaced now that `/ws` no longer
+    // validates its own bearer.
+    debug!(
+        "CWT accepted: sub={}, iss={}, aud={}",
+        claims.subject, claims.issuer, claims.audience
+    );
 
     let actor = match req.headers().get(ACTOR_TOKEN_HEADER) {
         None => None,

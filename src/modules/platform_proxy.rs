@@ -67,6 +67,8 @@ pub struct PlatformProxyState {
     /// This service's own CWT, sent as `X-Actor-Token` on every forwarded
     /// request so the upstream can see *who forwarded* the caller's bearer.
     /// Parsed once at startup: a bad value must fail loudly, not per-request.
+    /// Marked sensitive (`HeaderValue::set_sensitive`) so this struct's
+    /// derived `Debug` cannot print the credential.
     pub actor_token: Option<HeaderValue>,
 }
 
@@ -94,8 +96,12 @@ impl PlatformProxyState {
     /// platform verifies it and uses the actor token to authenticate the
     /// forwarder against the bearer's `act[]`.
     pub fn with_actor_token(self: Arc<Self>, token: &str) -> Result<Arc<Self>, String> {
-        let value = HeaderValue::from_str(token.trim())
+        let mut value = HeaderValue::from_str(token.trim())
             .map_err(|e| format!("service CWT is not a valid header value: {e}"))?;
+        // This is a live bearer credential and `PlatformProxyState` derives
+        // `Debug`; a non-sensitive `HeaderValue` prints its full contents.
+        // Marking it sensitive makes `{:?}` render `Sensitive` instead.
+        value.set_sensitive(true);
         Ok(Arc::new(Self {
             client: self.client.clone(),
             upstream_base: self.upstream_base.clone(),
@@ -582,6 +588,22 @@ mod header_tests {
 #[cfg(test)]
 mod actor_token_tests {
     use super::*;
+
+    /// `PlatformProxyState` derives `Debug` and the actor token is a live
+    /// bearer credential, so the stored `HeaderValue` must be sensitive.
+    #[test]
+    fn debug_does_not_print_the_service_cwt() {
+        let state = PlatformProxyState::new("https://platform.test")
+            .unwrap()
+            .with_actor_token("d2845820deadbeefcafe")
+            .unwrap();
+        let rendered = format!("{state:?}");
+        assert!(
+            !rendered.contains("deadbeefcafe"),
+            "service CWT leaked into Debug: {rendered}"
+        );
+    }
+
     use axum::{routing::any, Router};
     use reqwest::Client;
     use tokio::net::TcpListener;

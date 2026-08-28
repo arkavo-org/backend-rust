@@ -254,7 +254,7 @@ export CHAIN_RPC_URL=ws://chain.arkavo.net          # Optional, disables chain v
 export OPENTDF_PLATFORM_URL=https://platform.svc:8443  # Upstream platform base URL
 export KAS_PROXY_MODE=connect                          # off | connect | rest | both
 export AUTHZ_PROXY=on                                  # Forward /authorization.v2.* to platform (independent of KAS_PROXY_MODE)
-export ARKS_SERVICE_CWT_PATH=/path/to/arks-service.cwt # Optional: path to this service's own CWT, relayed as X-Actor-Token when proxying
+export ARKS_SERVICE_CWT_PATH=/path/to/arks-service.cwt # REQUIRED when proxying: this service's own CWT, relayed as X-Actor-Token
 
 # HTTP/3 (requires --features http3)
 export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin to the public interface on a multi-homed host
@@ -290,7 +290,7 @@ export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin 
 - `rest` forwards `/kas/v2/rewrap` and `/kas/v2/kas_public_key`, replacing the local OpenTDF-compat shim.
 - `both` forwards all of the above.
 - `/ws` (NanoTDF) always stays local. See `docs/platform-proxy.md`.
-- `ARKS_SERVICE_CWT_PATH` is optional. When set, the file's contents are read once at startup and relayed as an `X-Actor-Token` header on every forwarded (proxied) request, so the upstream platform can verify this service as the caller's `act[]` forwarder. An unreadable path, or content that isn't a valid HTTP header value, fails the server at startup rather than per-request — but the file's content is not itself checked to be a real CWT at startup; a syntactically-valid-but-bogus value is only rejected later, per-request, by the upstream platform's own CWT verification. See `src/modules/platform_proxy.rs`.
+- `ARKS_SERVICE_CWT_PATH` is **required whenever a proxy route is mounted** — that is, whenever `KAS_PROXY_MODE` is not `off` or `AUTHZ_PROXY=on`. Startup fails with a message naming the variable if it is unset, the same way a missing `OPENTDF_PLATFORM_URL` does. The reason is spec §1: arks relays the caller's bearer untouched, so it must also identify *itself* as the forwarder; without an `X-Actor-Token` the platform sees a bare bearer, treats it as direct presentation, and the `act[]` delegation check is bypassed by omission on every relayed request. An operator who wants no actor token sets `KAS_PROXY_MODE=off` and leaves `AUTHZ_PROXY` unset. The file's contents are read once at startup and relayed as an `X-Actor-Token` header on every forwarded request. An unreadable path, or content that isn't a valid HTTP header value, fails the server at startup rather than per-request — but the content is not itself checked to be a real CWT at startup; a syntactically-valid-but-bogus value is only rejected later, per-request, by the upstream platform's own CWT verification, and the token is never re-read while the process runs (see "Service CWT lifetime" in `docs/platform-proxy.md`). See `src/modules/platform_proxy.rs`.
 
 **Note:** CWT bearer authentication (`CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, `CWT_EXPECTED_AUDIENCE`) gates every non-public route on this server — the `/ws` upgrade, `/kas/v2/rewrap` (when served locally; `KAS_PROXY_MODE=rest` replaces it with an ungated forward to the upstream platform, per the note above), all of `/media/v1/*` except `/media/v1/certificate`, and (when built with `--features c2pa_signing`) both `/c2pa/v1/sign` and `/c2pa/v1/validate` — not just WebSocket connections. See "Request authentication" in `PROTOCOL.md` for the full model.
 

@@ -644,7 +644,7 @@ pub fn verify_signed_request(
 pub fn local_router(state: Arc<RewrapState>, auth: Arc<CwtAuthState>) -> Router {
     let protected = Router::new()
         .route("/kas/v2/rewrap", post(rewrap_handler))
-        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .route_layer(axum::middleware::from_fn_with_state(auth, require_cwt))
         .with_state(state.clone());
     let public = Router::new()
         .route("/kas/v2/kas_public_key", get(kas_public_key_handler))

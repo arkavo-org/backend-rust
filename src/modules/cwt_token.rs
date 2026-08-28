@@ -30,9 +30,9 @@ pub struct CwtClaims {
     pub subject: String,
     pub issuer: String,
     pub audience: String,
-    // Read by `cwt_auth::require_cwt`, which nothing mounts yet — a later
-    // change hangs it on the rewrap and media routers. Until then clippy
-    // `--bin arks` without `--tests` would treat these as dead.
+    // Read by `cwt_auth::require_cwt`, which gates every non-public route:
+    // `/ws`, `/kas/v2/rewrap` (when served locally), `/media/v1/*` except
+    // the certificate, and both `/c2pa/v1/*` routes.
     /// RFC 8693 `act` chain: the `sub` of each actor that forwarded this
     /// token, innermost first.
     pub actors: Vec<String>,

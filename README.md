@@ -98,7 +98,7 @@ The server can be configured using environment variables. If not set, default va
 | CWT_KEYS_URL         | COSE key set URL for CWT signature verification (gates every non-public route, not only WebSocket) | https://identity.arkavo.net/.well-known/cose-keys |
 | CWT_EXPECTED_ISSUER  | Required CWT `iss` claim                 | https://identity.arkavo.net |
 | CWT_EXPECTED_AUDIENCE | Required CWT `aud` claim                | https://100.arkavo.net |
-| ARKS_SERVICE_CWT_PATH | Optional: path to a file containing this service's own CWT, relayed as `X-Actor-Token` when proxying to the upstream OpenTDF platform. Read once at startup — an unreadable file or invalid header value fails startup, not per-request. | (unset) |
+| ARKS_SERVICE_CWT_PATH | **Required whenever a proxy route is mounted** (`KAS_PROXY_MODE` != `off`, or `AUTHZ_PROXY=on`); startup fails with a message naming the variable if it is unset. Path to a file containing this service's own CWT, relayed as `X-Actor-Token` on every forwarded request so the upstream platform can check it against the caller bearer's `act[]`. Read once at startup — an unreadable file or a value that isn't a valid HTTP header value fails startup, not per-request. To run without an actor token, set `KAS_PROXY_MODE=off` and leave `AUTHZ_PROXY` unset. | (unset) |
 | NATS_URL             | URL for NATS connection                  | nats://localhost:4222       |
 | NATS_SUBJECT         | Default NATS subscription subject        | nanotdf.messages            |
 | REDIS_URL            | URL for Redis connection                 | redis://localhost:6379      |

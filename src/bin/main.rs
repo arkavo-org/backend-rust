@@ -28,9 +28,7 @@ use async_nats::Message as NatsMessage;
 use async_nats::{Client as NatsClient, PublishError};
 use aws_sdk_s3 as s3;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, State};
 use axum::response::IntoResponse;
 use flatbuffers::root;
 use futures_util::{SinkExt, StreamExt};
@@ -250,36 +248,69 @@ async fn log_request_middleware(
     response
 }
 
+/// Read this service's own CWT for relaying as `X-Actor-Token`.
+///
+/// `ARKS_SERVICE_CWT_PATH` is **required** whenever any proxy route is
+/// mounted (`KAS_PROXY_MODE` != `off`, or `AUTHZ_PROXY=on`). Spec §1 makes the
+/// forwarder's self-identification a MUST: without an actor token the upstream
+/// platform sees a bare forwarded bearer, treats it as direct presentation,
+/// and the `act[]` delegation check is bypassed by omission on every relayed
+/// request. Failing at startup — like a missing `OPENTDF_PLATFORM_URL` — is
+/// the only way that cannot be missed. An operator who wants no actor token
+/// turns proxying off instead.
+fn load_service_cwt(path: Option<String>) -> Result<String, String> {
+    let Some(path) = path else {
+        return Err(
+            "ARKS_SERVICE_CWT_PATH must be set whenever a proxy route is mounted \
+             (KAS_PROXY_MODE != off, or AUTHZ_PROXY=on): arks must identify itself \
+             to the upstream platform as the forwarder via X-Actor-Token. \
+             To run without an actor token, set KAS_PROXY_MODE=off and leave \
+             AUTHZ_PROXY unset."
+                .to_string(),
+        );
+    };
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("ARKS_SERVICE_CWT_PATH {path} unreadable: {e}"))
+}
+
+/// `/ws` (the NanoTDF KAS upgrade, 0x03 rewrap) behind the shared CWT gate.
+///
+/// `/ws` is a gated route like any other, so it runs the same `require_cwt`
+/// middleware as the rewrap/media/c2pa routers — that is what applies the
+/// spec §1 `act` rule (`X-Actor-Token` must be a valid CWT whose `sub` is in
+/// the bearer's `act[]`) to the primary KAS path.
+///
+/// `route_layer`, not `layer`: the middleware must apply only to `/ws` and
+/// must not wrap this router's fallback, or merging it into the app would
+/// turn every unmatched path into a 401. The public routes
+/// (`/.well-known/apple-app-site-association`, `/kas/v2/kas_public_key`,
+/// `/media/v1/certificate`) live on unlayered routers merged in alongside.
+fn ws_router(state: Arc<WebSocketState>, auth: Arc<cwt_auth::CwtAuthState>) -> axum::Router {
+    axum::Router::new()
+        .route("/ws", axum::routing::get(ws_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            cwt_auth::require_cwt,
+        ))
+        .with_state(state)
+}
+
 /// WebSocket upgrade handler for Axum
 async fn ws_handler(
     State(state): State<Arc<WebSocketState>>,
-    headers: HeaderMap,
+    Extension(subject): Extension<cwt_auth::AuthenticatedSubject>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(auth_header) = headers.get(AUTHORIZATION) else {
-        return (StatusCode::UNAUTHORIZED, "Missing Bearer CWT").into_response();
-    };
-    let Ok(auth_str) = auth_header.to_str() else {
-        return (StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response();
-    };
-
-    let cwt_claims = match state
-        .cwt_validator
-        .validate_authorization_header(auth_str)
-        .await
-    {
-        Ok(claims) => claims,
-        Err(e) => {
-            warn!("CWT validation failed: {}", e);
-            return (StatusCode::UNAUTHORIZED, "Invalid CWT").into_response();
-        }
-    };
+    // The bearer (and any `X-Actor-Token`) was already verified by the
+    // `require_cwt` middleware this route is mounted behind; the verified
+    // identity arrives as an extension. Re-validating here would be a second,
+    // drift-prone copy of the gate.
     info!(
-        "CWT token validated: sub={}, iss={}, aud={}",
-        cwt_claims.subject, cwt_claims.issuer, cwt_claims.audience
+        "CWT-authenticated /ws upgrade: sub={}, actor={:?}",
+        subject.sub, subject.actor
     );
     let claims = Claims {
-        sub: cwt_claims.subject,
+        sub: subject.sub,
         age: String::new(),
     };
 
@@ -558,24 +589,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             // When arks relays a caller's bearer to the platform it must also
             // identify itself as the forwarder, so the platform can check the
-            // bearer's `act[]`. Optional: unset means no actor assertion.
-            let state = match env::var("ARKS_SERVICE_CWT_PATH") {
-                Ok(path) => {
-                    let token = std::fs::read_to_string(&path).map_err(
-                        |e| -> Box<dyn std::error::Error> {
-                            format!("ARKS_SERVICE_CWT_PATH {path} unreadable: {e}").into()
-                        },
-                    )?;
-                    info!("Platform proxy will relay X-Actor-Token from {}", path);
-                    state
-                        .with_actor_token(&token)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
-                }
-                Err(_) => {
-                    info!("ARKS_SERVICE_CWT_PATH not set; forwarding without X-Actor-Token");
-                    state
-                }
-            };
+            // bearer's `act[]`. Required, not optional — see `load_service_cwt`.
+            let service_cwt_path = env::var("ARKS_SERVICE_CWT_PATH").ok();
+            let token = load_service_cwt(service_cwt_path.clone())
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let Some(path) = &service_cwt_path {
+                info!("Platform proxy will relay X-Actor-Token from {path}");
+            }
+            let state = state
+                .with_actor_token(&token)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             info!(
                 "Platform proxy enabled: mode={:?}, authz_proxy={}, upstream={}",
                 proxy_mode, authz_proxy, state.upstream_base
@@ -843,17 +866,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_state: server_state.clone(),
         nats_connection: nats_connection.clone(),
         apple_app_site_association: apple_app_site_association.clone(),
-        cwt_validator: cwt_validator.clone(),
     });
 
     // Combine all routers
     let app = Router::new()
-        .route("/ws", get(ws_handler))
         .route(
             "/.well-known/apple-app-site-association",
             get(apple_app_site_association_handler),
         )
-        .with_state(ws_state)
+        .with_state(ws_state.clone())
+        .merge(ws_router(ws_state, cwt_auth.clone()))
         .merge(opentdf_router)
         .merge(wellknown_router)
         .merge(connect_router)
@@ -2578,7 +2600,6 @@ struct WebSocketState {
     server_state: Arc<ServerState>,
     nats_connection: Arc<NatsConnection>,
     apple_app_site_association: Arc<RwLock<String>>,
-    cwt_validator: Arc<cwt_token::CwtValidator>,
 }
 
 impl ServerState {
@@ -2826,6 +2847,215 @@ mod tests {
     use p256::NistP256;
 
     use super::*;
+
+    /// Spec §1 makes the forwarder's self-identification a MUST: when arks
+    /// relays a caller's bearer to the platform it must also present its own
+    /// service CWT as `X-Actor-Token`, or the platform sees a bare bearer,
+    /// treats it as direct presentation, and the `act[]` mechanism is bypassed
+    /// by omission. So `ARKS_SERVICE_CWT_PATH` is required whenever any proxy
+    /// route is mounted — an operator who wants no actor token sets
+    /// `KAS_PROXY_MODE=off` and leaves `AUTHZ_PROXY` unset.
+    mod service_cwt {
+        use super::*;
+
+        #[test]
+        fn missing_path_fails_startup_naming_the_variable() {
+            let err = load_service_cwt(None).expect_err("unset path must fail startup");
+            assert!(
+                err.contains("ARKS_SERVICE_CWT_PATH"),
+                "error must name the variable: {err}"
+            );
+            assert!(
+                err.contains("KAS_PROXY_MODE=off"),
+                "error must state the remedy: {err}"
+            );
+        }
+
+        #[test]
+        fn unreadable_path_fails_startup() {
+            let err = load_service_cwt(Some("/nonexistent/arks-service.cwt".to_string()))
+                .expect_err("unreadable file must fail startup");
+            assert!(err.contains("ARKS_SERVICE_CWT_PATH"), "{err}");
+            assert!(err.contains("unreadable"), "{err}");
+        }
+
+        #[test]
+        fn readable_path_is_returned_trimmed() {
+            let dir = std::env::temp_dir().join(format!("arks-cwt-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("service.cwt");
+            std::fs::write(&path, "  d2845820abc\n").unwrap();
+            let token = load_service_cwt(Some(path.to_string_lossy().into_owned())).unwrap();
+            assert_eq!(token.trim(), "d2845820abc");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Route-level tests for the CWT gate on `/ws`.
+    ///
+    /// `/ws` is the NanoTDF KAS (0x03 rewrap) and is a gated route, so the
+    /// spec §1 `act` rule has to apply to it: an `X-Actor-Token` whose `sub`
+    /// is not in the bearer's `act[]` must 401. Before `/ws` was mounted
+    /// behind `require_cwt` the handler validated only the bearer and ignored
+    /// the actor header entirely, so such a request was upgraded.
+    ///
+    /// The 401 comes from the middleware before the handler runs, so the
+    /// state below is never dereferenced: its Redis/NATS/S3 clients are
+    /// lazily-constructed handles that open no connection.
+    mod ws_gate {
+        use super::*;
+        use crate::modules::cwt_token::{test_support, CwtValidator};
+        use tokio::net::TcpListener;
+
+        fn test_ws_state() -> Arc<WebSocketState> {
+            let settings = ServerSettings {
+                port: 0,
+                tls_enabled: false,
+                tls_cert_path: String::new(),
+                tls_key_path: String::new(),
+                kas_key_path: String::new(),
+                enable_timing_logs: false,
+                nats_url: "nats://127.0.0.1:4222".to_string(),
+                nats_subject: "test.subject".to_string(),
+                redis_url: "redis://127.0.0.1:6379".to_string(),
+                s3_bucket: "test-bucket".to_string(),
+                chain_rpc_url: None,
+                cwt_keys_url: String::new(),
+                cwt_expected_issuer: "https://identity.test".to_string(),
+                cwt_expected_audience: "https://arks.test".to_string(),
+            };
+            let aws = aws_config::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build();
+            Arc::new(WebSocketState {
+                server_state: Arc::new(ServerState {
+                    settings,
+                    redis_client: RedisClient::open("redis://127.0.0.1:6379").unwrap(),
+                    s3_client: s3::Client::new(&aws),
+                    chain_validator: None,
+                }),
+                nats_connection: Arc::new(NatsConnection::new("nats://127.0.0.1:4222".to_string())),
+                apple_app_site_association: Arc::new(RwLock::new(String::new())),
+            })
+        }
+
+        async fn spawn() -> (String, test_support::Signer, wiremock::MockServer) {
+            let (signer, set) = test_support::keypair_and_set();
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/.well-known/cose-keys"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_raw(set, "application/cbor"),
+                )
+                .mount(&mock)
+                .await;
+            let auth = Arc::new(cwt_auth::CwtAuthState {
+                validator: Arc::new(CwtValidator::new(
+                    format!("{}/.well-known/cose-keys", mock.uri()),
+                    "https://identity.test".into(),
+                    "https://arks.test".into(),
+                )),
+            });
+            let app = ws_router(test_ws_state(), auth);
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), signer, mock)
+        }
+
+        /// The fix that matters: an actor token that is itself valid but is
+        /// not listed in the bearer's `act[]` must be rejected on `/ws`, not
+        /// silently ignored.
+        #[tokio::test]
+        async fn actor_token_not_in_act_is_401() {
+            let (base, signer, _mock) = spawn().await;
+            let bearer = signer.mint_with_act(
+                &[
+                    ("iss", "https://identity.test"),
+                    ("sub", "did:key:z6Mka"),
+                    ("aud", "https://arks.test"),
+                ],
+                &["https://authorized-relay.test"],
+            );
+            let actor = signer.mint(&[
+                ("iss", "https://identity.test"),
+                ("sub", "https://rogue-relay.test"),
+                ("aud", "https://arks.test"),
+            ]);
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth(&bearer)
+                .header("X-Actor-Token", &actor)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(
+                r.text().await.unwrap(),
+                "Actor not authorized for this token"
+            );
+        }
+
+        /// An actor listed in the bearer's `act[]` gets past the gate. It
+        /// then fails the WebSocket upgrade (plain GET, no upgrade headers),
+        /// which is the proof it reached the handler rather than the gate.
+        #[tokio::test]
+        async fn authorized_actor_passes_the_gate() {
+            let (base, signer, _mock) = spawn().await;
+            let bearer = signer.mint_with_act(
+                &[
+                    ("iss", "https://identity.test"),
+                    ("sub", "did:key:z6Mka"),
+                    ("aud", "https://arks.test"),
+                ],
+                &["https://authorized-relay.test"],
+            );
+            let actor = signer.mint(&[
+                ("iss", "https://identity.test"),
+                ("sub", "https://authorized-relay.test"),
+                ("aud", "https://arks.test"),
+            ]);
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth(&bearer)
+                .header("X-Actor-Token", &actor)
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(r.status(), 401, "authorized actor must not be rejected");
+        }
+
+        #[tokio::test]
+        async fn missing_bearer_is_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::get(format!("{base}/ws")).await.unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(r.text().await.unwrap(), "Missing Bearer CWT");
+        }
+
+        #[tokio::test]
+        async fn invalid_bearer_is_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth("not-a-cwt")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(r.text().await.unwrap(), "Invalid CWT");
+        }
+
+        /// `route_layer`, not `layer`: the gate must not swallow the 404 for
+        /// an unmatched path when this router is merged into the app.
+        #[tokio::test]
+        async fn unmatched_path_is_404_not_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::get(format!("{base}/nope")).await.unwrap();
+            assert_eq!(r.status(), 404);
+        }
+    }
 
     /// The KAS EC secret must never reach a log line: `KasKeys` derives
     /// `Debug`, so the redaction has to come from `SecureEcPrivateKey` itself.
