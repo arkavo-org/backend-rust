@@ -64,30 +64,38 @@ pub async fn require_cwt(
         }
     };
 
-    let actor = match req
-        .headers()
-        .get(ACTOR_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    let actor = match req.headers().get(ACTOR_TOKEN_HEADER) {
         None => None,
-        Some(raw) => match state.validator.validate_bearer(raw).await {
-            Err(e) => {
-                warn!("actor token invalid: {e}");
+        Some(value) => {
+            // A present-but-non-UTF-8 header must 401, not be silently
+            // treated as absent — that would let a malformed forwarder
+            // header fall through to a direct presentation.
+            let Ok(raw) = value.to_str() else {
+                warn!("actor token header is not valid UTF-8");
                 return unauthorized("Invalid actor token");
-            }
-            Ok(actor_claims) => {
-                if actor_claims.subject != claims.subject
-                    && !claims.actors.iter().any(|a| a == &actor_claims.subject)
-                {
-                    warn!(
-                        "actor {} not authorized in act for subject {}",
-                        actor_claims.subject, claims.subject
-                    );
-                    return unauthorized("Actor not authorized for this token");
+            };
+            match state.validator.validate_bearer(raw).await {
+                Err(e) => {
+                    warn!("actor token invalid: {e}");
+                    return unauthorized("Invalid actor token");
                 }
-                Some(actor_claims.subject)
+                Ok(actor_claims) => {
+                    // Spec §1: the actor's `sub` MUST appear in the
+                    // bearer's `act[].sub`. Membership in `claims.actors`
+                    // is the only thing that authorizes an actor — there
+                    // is no same-`sub` self-escape, even when `act[]` is
+                    // empty.
+                    if !claims.actors.iter().any(|a| a == &actor_claims.subject) {
+                        warn!(
+                            "actor {} not authorized in act for subject {}",
+                            actor_claims.subject, claims.subject
+                        );
+                        return unauthorized("Actor not authorized for this token");
+                    }
+                    Some(actor_claims.subject)
+                }
             }
-        },
+        }
     };
 
     req.extensions_mut().insert(AuthenticatedSubject {
@@ -233,5 +241,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), 401);
+    }
+
+    // Finding #3a: the old guard let a same-`sub` actor through even when
+    // the bearer's `act[]` was empty (a `!=` self-escape around the
+    // membership check). Spec §1 says membership in `act[]` is the only
+    // thing that authorizes an actor.
+    #[tokio::test]
+    async fn same_sub_actor_without_act_membership_is_401() {
+        let (state, signer, _mock) = state_with_keys().await;
+        let base = spawn(state).await;
+        let bearer_no_act = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let actor_same_sub = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let r = reqwest::Client::new()
+            .get(format!("{base}/private"))
+            .bearer_auth(&bearer_no_act)
+            .header("X-Actor-Token", &actor_same_sub)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+
+    // Finding #3b: a present-but-non-UTF-8 `X-Actor-Token` must 401, not be
+    // treated as an absent header (which would silently fall through to a
+    // direct presentation).
+    #[tokio::test]
+    async fn non_utf8_actor_header_is_401() {
+        let (state, signer, _mock) = state_with_keys().await;
+        let base = spawn(state).await;
+        let bearer = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let r = reqwest::Client::new()
+            .get(format!("{base}/private"))
+            .bearer_auth(&bearer)
+            .header("X-Actor-Token", vec![0xFF, 0xFE, 0xFD])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+
+    // Finding #5: the `Err(e)` arm of actor-token validation — a header
+    // that is present, valid UTF-8, but not a valid CWT itself (here: wrong
+    // audience) — was untested. `act`-membership denial is covered by
+    // `forwarded_token_requires_actor_in_act` above; this is the *invalid
+    // token* arm.
+    #[tokio::test]
+    async fn invalid_actor_token_is_401() {
+        let (state, signer, _mock) = state_with_keys().await;
+        let base = spawn(state).await;
+        let bearer = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let bad_actor = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "https://kg.test"),
+            ("aud", "https://wrong.test"),
+        ]);
+        let r = reqwest::Client::new()
+            .get(format!("{base}/private"))
+            .bearer_auth(&bearer)
+            .header("X-Actor-Token", &bad_actor)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
     }
 }

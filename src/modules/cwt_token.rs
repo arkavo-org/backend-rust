@@ -198,8 +198,18 @@ impl CwtValidator {
         &self,
         auth_header: &str,
     ) -> Result<CwtClaims, CwtTokenError> {
-        let token = auth_header
-            .strip_prefix("Bearer ")
+        // RFC 7235 §2.1: the auth-scheme token is case-insensitive, so
+        // `bearer <tok>` / `BEARER <tok>` must be accepted, not just
+        // `Bearer <tok>`.
+        let mut parts = auth_header.splitn(2, ' ');
+        let scheme = parts
+            .next()
+            .ok_or(CwtTokenError::InvalidAuthorizationHeader)?;
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            return Err(CwtTokenError::InvalidAuthorizationHeader);
+        }
+        let token = parts
+            .next()
             .ok_or(CwtTokenError::InvalidAuthorizationHeader)?;
         if token.trim().is_empty() || token.contains(char::is_whitespace) {
             return Err(CwtTokenError::InvalidAuthorizationHeader);
@@ -417,8 +427,8 @@ fn parse_claims(payload: &[u8]) -> Result<RawClaims, CwtTokenError> {
                     }
                     _ => {}
                 },
-                4 => claims.exp = numeric_seconds(&value),
-                5 => claims.nbf = numeric_seconds(&value),
+                4 => claims.exp = Some(numeric_seconds(&value)?),
+                5 => claims.nbf = Some(numeric_seconds(&value)?),
                 _ => {}
             },
             Value::Text(name) => match name.as_str() {
@@ -468,11 +478,25 @@ fn text_array(items: Vec<Value>) -> Vec<String> {
 }
 
 /// RFC 8392 NumericDate: a CBOR integer or float count of seconds.
-fn numeric_seconds(value: &Value) -> Option<f64> {
+///
+/// Fail-closed: a present `exp`/`nbf` that isn't a well-formed NumericDate
+/// (wrong CBOR type, integer too large for `i64`, or a non-finite float
+/// such as NaN/±inf) must reject the whole claims set rather than silently
+/// treat the claim as absent — an absent `nbf` legitimately disables the
+/// not-before check, but a malformed one must not be able to reach that
+/// same "no check" outcome.
+fn numeric_seconds(value: &Value) -> Result<f64, CwtTokenError> {
     match value {
-        Value::Integer(i) => i64::try_from(*i).ok().map(|v| v as f64),
-        Value::Float(f) => Some(*f),
-        _ => None,
+        Value::Integer(i) => i64::try_from(*i).map(|v| v as f64).map_err(|_| {
+            CwtTokenError::InvalidCoseSign1("NumericDate integer out of range".into())
+        }),
+        Value::Float(f) if f.is_finite() => Ok(*f),
+        Value::Float(_) => Err(CwtTokenError::InvalidCoseSign1(
+            "NumericDate float is not finite".into(),
+        )),
+        _ => Err(CwtTokenError::InvalidCoseSign1(
+            "NumericDate claim is not a number".into(),
+        )),
     }
 }
 
@@ -734,6 +758,112 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CwtTokenError::InvalidCoseSign1(_)));
+    }
+
+    // Finding #1: the old `coset` path rejected the whole claims set (via
+    // `Timestamp::from_cbor_value`'s type error) when `nbf` wasn't a
+    // NumericDate. The rewrite must fail closed the same way, not treat a
+    // non-numeric `nbf` as absent (which would skip the not-before check
+    // entirely and accept a token before its validity window opens).
+    #[tokio::test]
+    async fn rejects_non_numeric_nbf() {
+        let (validator, token) = raw_claims_token(vec![
+            (Value::Integer(1.into()), Value::Text(ISSUER.to_string())),
+            (
+                Value::Integer(2.into()),
+                Value::Text("test-subject".to_string()),
+            ),
+            (Value::Integer(3.into()), Value::Text(AUDIENCE.to_string())),
+            (
+                Value::Integer(4.into()),
+                Value::Integer(now_plus(300).into()),
+            ),
+            (
+                Value::Integer(5.into()),
+                Value::Text("not-a-numeric-date".to_string()),
+            ),
+        ]);
+        let err = validator
+            .validate_authorization_header(&format!("Bearer {token}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CwtTokenError::InvalidCoseSign1(_)),
+            "non-numeric nbf must be rejected, not silently ignored: {err:?}"
+        );
+    }
+
+    // Finding #2: a non-finite `exp` (NaN) makes `exp <= now` false, so the
+    // token would never expire if `numeric_seconds` accepted it.
+    #[tokio::test]
+    async fn rejects_nan_exp() {
+        let (validator, token) = raw_claims_token(vec![
+            (Value::Integer(1.into()), Value::Text(ISSUER.to_string())),
+            (
+                Value::Integer(2.into()),
+                Value::Text("test-subject".to_string()),
+            ),
+            (Value::Integer(3.into()), Value::Text(AUDIENCE.to_string())),
+            (Value::Integer(4.into()), Value::Float(f64::NAN)),
+        ]);
+        let err = validator
+            .validate_authorization_header(&format!("Bearer {token}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CwtTokenError::InvalidCoseSign1(_)),
+            "NaN exp must be rejected, not accepted: {err:?}"
+        );
+    }
+
+    // Finding #4: RFC 7235 §2.1 makes the auth-scheme token case-insensitive.
+    #[tokio::test]
+    async fn accepts_lowercase_bearer_scheme() {
+        let (validator, token) = validator_and_token(AUDIENCE, now_plus(300), None);
+        let claims = validator
+            .validate_authorization_header(&format!("bearer {token}"))
+            .await
+            .unwrap();
+        assert_eq!(claims.subject, "test-subject");
+    }
+
+    /// Sign an arbitrary CBOR claims map, bypassing `coset::cwt::ClaimsSet`
+    /// so tests can put non-NumericDate values in `exp`/`nbf`.
+    fn raw_claims_token(payload_map: Vec<(Value, Value)>) -> (CwtValidator, String) {
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let kid = vec![1, 2, 3, 4];
+        let public_point = verifying_key.to_encoded_point(false);
+        let x = public_point.x().unwrap().to_vec();
+        let y = public_point.y().unwrap().to_vec();
+        let key = CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x, y)
+            .key_id(kid.clone())
+            .algorithm(iana::Algorithm::ES256)
+            .build();
+        let validator = CwtValidator::from_key_set(
+            ISSUER.to_string(),
+            AUDIENCE.to_string(),
+            CoseKeySet(vec![key]),
+        );
+
+        let payload_value = Value::Map(payload_map);
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&payload_value, &mut payload).unwrap();
+        let protected = HeaderBuilder::new()
+            .algorithm(iana::Algorithm::ES256)
+            .key_id(kid.to_vec())
+            .build();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .try_create_signature(b"", |tbs| {
+                let signature: Signature = signing_key.sign(tbs);
+                Ok::<_, CwtTokenError>(signature.to_bytes().to_vec())
+            })
+            .unwrap()
+            .build();
+        let token = URL_SAFE_NO_PAD.encode(sign1.to_tagged_vec().unwrap());
+        (validator, token)
     }
 
     fn validator_and_token(audience: &str, exp: i64, nbf: Option<i64>) -> (CwtValidator, String) {
