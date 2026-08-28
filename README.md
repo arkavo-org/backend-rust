@@ -95,9 +95,10 @@ The server can be configured using environment variables. If not set, default va
 | TLS_CERT_PATH        | Path to the TLS certificate file         | ./fullchain.pem             |
 | TLS_KEY_PATH         | Path to the TLS private key file         | ./privkey.pem               |
 | KAS_KEY_PATH         | Path to the KAS private key file         | ./recipient_private_key.pem |
-| CWT_KEYS_URL         | COSE key set URL for WebSocket CWT validation | https://identity.arkavo.net/.well-known/cose-keys |
-| CWT_EXPECTED_ISSUER  | Expected CWT issuer for WebSocket auth   | https://identity.arkavo.net |
-| CWT_EXPECTED_AUDIENCE | Expected CWT audience for WebSocket auth | https://100.arkavo.net |
+| CWT_KEYS_URL         | COSE key set URL for CWT signature verification (gates every non-public route, not only WebSocket) | https://identity.arkavo.net/.well-known/cose-keys |
+| CWT_EXPECTED_ISSUER  | Required CWT `iss` claim                 | https://identity.arkavo.net |
+| CWT_EXPECTED_AUDIENCE | Required CWT `aud` claim                | https://100.arkavo.net |
+| ARKS_SERVICE_CWT_PATH | Optional: path to a file containing this service's own CWT, relayed as `X-Actor-Token` when proxying to the upstream OpenTDF platform. Read once at startup — an unreadable file or invalid header value fails startup, not per-request. | (unset) |
 | NATS_URL             | URL for NATS connection                  | nats://localhost:4222       |
 | NATS_SUBJECT         | Default NATS subscription subject        | nanotdf.messages            |
 | REDIS_URL            | URL for Redis connection                 | redis://localhost:6379      |
@@ -106,7 +107,7 @@ The server can be configured using environment variables. If not set, default va
 
 All file paths are relative to the current working directory where the server is run.
 
-**Security Note:** WebSocket clients must present a valid CWT signed by a key from `CWT_KEYS_URL`.
+**Security Note:** Every non-public route requires a valid CWT bearer signed by a key from `CWT_KEYS_URL` — this includes the WebSocket upgrade and the HTTP routes (rewrap, media, and C2PA signing). The only routes reachable without a bearer are `GET /.well-known/apple-app-site-association`, `GET /kas/v2/kas_public_key`, and `GET /media/v1/certificate`. See "Request authentication" in [PROTOCOL.md](PROTOCOL.md) for the full model.
 
 ```env
 export PORT=8443

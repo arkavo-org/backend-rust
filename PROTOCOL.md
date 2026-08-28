@@ -53,16 +53,24 @@ All binary messages use a single-byte type prefix:
 | 0x06 | Event | Bidirectional | FlatBuffers event |
 | 0xFF | Error | Server → Client | JSON error response |
 
-## Authentication
+## Request authentication
+
+Authentication is CWT-only across this server — every non-public route, whether it
+speaks the binary WebSocket protocol or plain HTTP, requires a bearer CWT. There is
+no legacy JWT/OAuth fallback and no way to disable the check.
 
 ### CWT Bearer Token
 
-The WebSocket upgrade requires an `Authorization` header containing a base64url-encoded
-COSE_Sign1 CWT:
+Every request to a non-public route must carry an `Authorization` header with a
+base64url-encoded COSE_Sign1 CWT:
 
 ```http
 Authorization: Bearer <base64url-cose-sign1-cwt>
 ```
+
+This applies to the `/ws` WebSocket upgrade and to the HTTP routes below alike. The
+CWT is verified against a COSE key fetched from `CWT_KEYS_URL`, and must carry the
+expected `iss` and `aud` claims.
 
 **Configuration:**
 - `CWT_KEYS_URL`: COSE key set endpoint for signature verification
@@ -70,6 +78,76 @@ Authorization: Bearer <base64url-cose-sign1-cwt>
 - `CWT_EXPECTED_AUDIENCE`: required `aud` claim
 
 **Supported Algorithm:** ES256 over P-256 COSE keys
+
+### Public routes
+
+Exactly three routes are reachable without a bearer CWT, because clients need them
+before they can present one (fetching a key, fetching a certificate) or because
+they carry no secret (a static site-association document):
+
+- `GET /.well-known/apple-app-site-association`
+- `GET /kas/v2/kas_public_key`
+- `GET /media/v1/certificate`
+
+Every other route enforces the bearer CWT requirement above — including
+`/ws`, `POST /kas/v2/rewrap`, the remaining `/media/v1/*` routes, and (when the
+server is built with `--features c2pa_signing`) both `POST /c2pa/v1/sign` and
+`POST /c2pa/v1/validate`. `/c2pa/v1/sign` in particular signs whatever hash the
+caller supplies with the server's C2PA key, so leaving it ungated would make it an
+unauthenticated signing oracle.
+
+The list above is the surface gated by the shared `require_cwt` middleware. Two
+optional, off-by-default features add routes outside that middleware:
+
+- **Pass-through proxying** (`KAS_PROXY_MODE=rest|connect|both`, `AUTHZ_PROXY=on`):
+  the forwarded routes (`/kas/v2/rewrap` and `/kas/v2/kas_public_key` under `rest`,
+  the `/kas.AccessService/*` ConnectRPC routes, `/authorization.v2.*`, and
+  `/.well-known/opentdf-configuration`/`/attributes`/`/attr/*`) are not gated by
+  arks's local CWT middleware at all — the upstream OpenTDF platform is the trust
+  boundary and performs its own authentication/authorization on the forwarded
+  request. `KAS_PROXY_MODE=rest` in particular *replaces* the locally-gated
+  `/kas/v2/rewrap` handler with an ungated forward.
+- **AuthZEN 1.0 facade** (`AUTHZEN_FACADE=on`): `POST /access/v1/evaluation` and
+  `POST /access/v1/evaluations` require a bearer CWT too, but verify it themselves
+  (see `src/modules/authzen/`) rather than running through the shared `require_cwt`
+  middleware. `GET /.well-known/authzen-configuration` is public discovery,
+  mirroring `/kas/v2/kas_public_key`.
+
+### `X-Actor-Token` (delegation)
+
+A caller forwarding another party's bearer CWT (for example, a relay acting on a
+user's behalf) may additionally present:
+
+```http
+X-Actor-Token: <base64url-cose-sign1-cwt>
+```
+
+If `X-Actor-Token` is present, it MUST itself be a valid CWT, and its `sub` claim
+MUST appear in the bearer token's `act[]` claim. If either check fails — the actor
+token doesn't verify, or its `sub` is not listed in the bearer's `act[]` — the
+request is rejected with 401, even if the bearer token alone would have been
+valid. There is no same-`sub` self-escape: membership in `act[]` is the only thing
+that authorizes an actor.
+
+### Rewrap request-signature JWT is not an authentication token
+
+`POST /kas/v2/rewrap` accepts a `signed_request_token` JWT in the request body per
+the OpenTDF rewrap protocol. (This is distinct from the binary WebSocket Rewrap
+message (0x03) described above, whose payload is a raw NanoTDF object with no JWT
+wrapper.) This JWT is **not** an authentication credential — caller identity is established
+separately by the CWT bearer above. Instead, it is a protocol-level
+proof-of-possession: the JWT's own payload (`requestBody`) embeds the client's
+ephemeral `clientPublicKey`, and the server verifies the JWT's signature against
+*that* embedded key before trusting its contents. This binds the signed request to
+the specific ephemeral key the client is asking the KAS to rewrap toward, so a
+captured `signed_request_token` cannot be replayed with a substituted key.
+
+### Failure responses
+
+All authentication failures (missing bearer, invalid CWT, invalid or unauthorized
+`X-Actor-Token`) return `401 Unauthorized` with a plain-text body such as
+`Missing Bearer CWT`, `Invalid CWT`, or `Actor not authorized for this token` —
+not a JSON error envelope.
 
 ## ECDH Key Agreement (0x01)
 
@@ -209,7 +287,7 @@ Attribute-based access using JWT claims subject.
 
 **Subscriptions:**
 1. Global: `nanotdf.messages` (configurable via `NATS_SUBJECT`)
-2. User-specific: `profile.<publicID>` (after JWT authentication)
+2. User-specific: `profile.<publicID>` (after CWT bearer authentication)
 
 Messages received from NATS are forwarded to WebSocket clients with 0x05 prefix.
 
@@ -329,7 +407,7 @@ HKDF-SHA256(
 |---------|------------------|---------------------|
 | Transport | REST/HTTP | WebSocket |
 | Protocol | JSON | Custom Binary |
-| Authentication | Bearer Token (HTTP header) | CWT Bearer token (WebSocket upgrade) |
+| Authentication | Bearer Token (HTTP header) | CWT Bearer token (WebSocket upgrade and HTTP routes alike; see "Request authentication") |
 | Rewrap Endpoint | POST /kas/v2/rewrap | Binary message type 0x03 |
 | Key Agreement | Per-request or cached | Session-based ECDH |
 | Push Events | Not supported | NATS pub/sub + type 0x05/0x06 |
@@ -338,7 +416,7 @@ HKDF-SHA256(
 
 ## Testing Recommendations
 
-1. **CWT Configuration:** Set `CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, and `CWT_EXPECTED_AUDIENCE` for WebSocket authentication
+1. **CWT Configuration:** Set `CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, and `CWT_EXPECTED_AUDIENCE` — required for every non-public route, not only the WebSocket upgrade
 2. **NATS Availability:** Ensure NATS server is running or expect NATS-related errors
 3. **Redis Caching:** Events require Redis for UserEvent/CacheEvent
 4. **Test Vectors:** Use OpenTDF NanoTDF test vectors for rewrap validation
@@ -380,9 +458,10 @@ S→C: [0xFF]{"error_type":"invalid_format","message":"Session not established -
 | TLS_CERT_PATH | ./fullchain.pem | TLS certificate (optional) |
 | TLS_KEY_PATH | ./privkey.pem | TLS private key (optional) |
 | KAS_KEY_PATH | ./recipient_private_key.pem | KAS EC private key (required) |
-| CWT_KEYS_URL | https://identity.arkavo.net/.well-known/cose-keys | COSE key set URL for WebSocket CWT validation |
-| CWT_EXPECTED_ISSUER | https://identity.arkavo.net | Required CWT issuer |
-| CWT_EXPECTED_AUDIENCE | https://100.arkavo.net | Required CWT audience |
+| CWT_KEYS_URL | https://identity.arkavo.net/.well-known/cose-keys | COSE key set URL for CWT signature verification (gates every non-public route, not only `/ws`) |
+| CWT_EXPECTED_ISSUER | https://identity.arkavo.net | Required CWT `iss` claim |
+| CWT_EXPECTED_AUDIENCE | https://100.arkavo.net | Required CWT `aud` claim |
+| ARKS_SERVICE_CWT_PATH | - | Optional. Path to a file containing this service's own CWT, relayed as `X-Actor-Token` when arks proxies a request to the upstream OpenTDF platform. Read once at startup; an unreadable file or a value that isn't a valid HTTP header fails startup, not per-request. |
 | NATS_URL | nats://localhost:4222 | NATS server URL |
 | NATS_SUBJECT | nanotdf.messages | Default NATS subscription subject |
 | REDIS_URL | redis://localhost:6379 | Redis connection string |

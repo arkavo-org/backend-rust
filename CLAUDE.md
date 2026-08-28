@@ -228,15 +228,14 @@ export NATS_SUBJECT=nanotdf.messages
 export REDIS_URL=redis://localhost:6379
 export ENABLE_TIMING_LOGS=true                     # Performance logging
 export RUST_LOG=info                               # Logging level
-export CWT_KEYS_URL=https://identity.arkavo.net/.well-known/cose-keys  # WebSocket CWT keys
-export CWT_EXPECTED_ISSUER=https://identity.arkavo.net                 # WebSocket CWT issuer
-export CWT_EXPECTED_AUDIENCE=https://100.arkavo.net                    # WebSocket CWT audience
+export CWT_KEYS_URL=https://identity.arkavo.net/.well-known/cose-keys  # COSE key set for CWT signature verification
+export CWT_EXPECTED_ISSUER=https://identity.arkavo.net                 # Required CWT `iss` claim
+export CWT_EXPECTED_AUDIENCE=https://100.arkavo.net                    # Required CWT `aud` claim
 
 # Media DRM Configuration
 export MAX_CONCURRENT_STREAMS=5                    # Max simultaneous streams per user
 export ENABLE_MEDIA_ANALYTICS=true                 # Publish metrics to NATS
 export MEDIA_METRICS_SUBJECT=media.metrics         # NATS subject for analytics events
-export OAUTH_PUBLIC_KEY_PATH=/path/to/oauth_public.pem  # Optional JWT validation
 
 # C2PA Content Authenticity Configuration (optional)
 export C2PA_SIGNING_KEY_PATH=/path/to/c2pa_private_key.pem
@@ -255,6 +254,7 @@ export CHAIN_RPC_URL=ws://chain.arkavo.net          # Optional, disables chain v
 export OPENTDF_PLATFORM_URL=https://platform.svc:8443  # Upstream platform base URL
 export KAS_PROXY_MODE=connect                          # off | connect | rest | both
 export AUTHZ_PROXY=on                                  # Forward /authorization.v2.* to platform (independent of KAS_PROXY_MODE)
+export ARKS_SERVICE_CWT_PATH=/path/to/arks-service.cwt # Optional: path to this service's own CWT, relayed as X-Actor-Token when proxying
 
 # HTTP/3 (requires --features http3)
 export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin to the public interface on a multi-homed host
@@ -290,6 +290,9 @@ export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin 
 - `rest` forwards `/kas/v2/rewrap` and `/kas/v2/kas_public_key`, replacing the local OpenTDF-compat shim.
 - `both` forwards all of the above.
 - `/ws` (NanoTDF) always stays local. See `docs/platform-proxy.md`.
+- `ARKS_SERVICE_CWT_PATH` is optional. When set, the file's contents are read once at startup and relayed as an `X-Actor-Token` header on every forwarded (proxied) request, so the upstream platform can verify this service as the caller's `act[]` forwarder. An unreadable path, or content that isn't a valid HTTP header value, fails the server at startup rather than per-request — but the file's content is not itself checked to be a real CWT at startup; a syntactically-valid-but-bogus value is only rejected later, per-request, by the upstream platform's own CWT verification. See `src/modules/platform_proxy.rs`.
+
+**Note:** CWT bearer authentication (`CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, `CWT_EXPECTED_AUDIENCE`) gates every non-public route on this server — the `/ws` upgrade, `/kas/v2/rewrap`, all of `/media/v1/*` except `/media/v1/certificate`, and (when built with `--features c2pa_signing`) both `/c2pa/v1/sign` and `/c2pa/v1/validate` — not just WebSocket connections. See "Request authentication" in `PROTOCOL.md` for the full model.
 
 **Note:** For HTTP/3 (QUIC) support:
 - Optional and disabled unless built with `--features http3`.
@@ -479,7 +482,7 @@ export MEDIA_METRICS_SUBJECT=media.metrics
 ## Security Notes
 
 - Private keys (KAS, TLS) must never be committed to version control
-- JWT signature validation is disabled for development - enable in production via `OAUTH_PUBLIC_KEY_PATH`
+- Authentication is CWT-only: every non-public route requires a `Bearer` CWT verified against `CWT_KEYS_URL`/`CWT_EXPECTED_ISSUER`/`CWT_EXPECTED_AUDIENCE`; there is no way to disable this check. See "Request authentication" in `PROTOCOL.md`.
 - Self-signed certificates are for development only
 - Session IDs should be treated as secrets (contain user_id + asset_id)
 - Apple App Site Association file (`apple-app-site-association.json`) is served at `/.well-known/apple-app-site-association`
