@@ -144,10 +144,27 @@ captured `signed_request_token` cannot be replayed with a substituted key.
 
 ### Failure responses
 
-All authentication failures (missing bearer, invalid CWT, invalid or unauthorized
+For the routes gated by the shared `require_cwt` middleware (rewrap, media,
+c2pa) and for the `/ws` handler's own equivalent bearer check, all
+authentication failures (missing bearer, invalid CWT, invalid or unauthorized
 `X-Actor-Token`) return `401 Unauthorized` with a plain-text body such as
 `Missing Bearer CWT`, `Invalid CWT`, or `Actor not authorized for this token` —
 not a JSON error envelope.
+
+The AuthZEN facade routes are the exception: since they verify the CWT
+themselves (`authenticate_pep` in `src/modules/authzen/facade.rs`) rather than
+running through `require_cwt`, their failures use a different shape entirely —
+a JSON envelope (`{"error": "<message>"}`, via `err_json`) and a status code
+that depends on *why* authentication failed, not always 401:
+- an invalid or missing credential → `401` with `{"error": "invalid pep credential"}`
+- a credential that verifies but whose client isn't on the configured
+  allowlist → `403` with `{"error": "pep client not allowlisted"}`
+- the facade's own key set being unavailable → `500` with
+  `{"error": "key set unavailable"}`
+
+An integrator writing an AuthZEN client against this document should expect
+the JSON-envelope/variable-status shape on `/access/v1/evaluation(s)`, not the
+plain-text-401 shape used everywhere else.
 
 ## ECDH Key Agreement (0x01)
 
@@ -273,7 +290,7 @@ Enforces age-based content restrictions using FlatBuffers rating metadata.
 
 #### 3. Simple ABAC (5Cqk3ERPToSMuY8UoKJtcmo4fs1iVyQpq6ndzWzpzWezAF1W)
 
-Attribute-based access using JWT claims subject.
+Attribute-based access using the CWT-derived connection subject (`Claims.sub`, set from the bearer's `sub` claim — see "Request authentication").
 
 ## NATS Integration (0x05)
 

@@ -204,7 +204,7 @@ FlatBuffers-based event handling (schemas in `src/bin/schemas/`):
 
 Each WebSocket connection maintains:
 - Ephemeral ECDH shared secret with random salt
-- JWT claims (subject/publicID and age verification)
+- CWT-derived subject (publicID); no age claim (CWTs carry no age claim, so age-gated policy contracts fail closed to the most restrictive level — see `src/bin/main.rs`)
 - Bidirectional message channel for NATS subscription forwarding
 
 ### Cryptography
@@ -292,7 +292,7 @@ export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin 
 - `/ws` (NanoTDF) always stays local. See `docs/platform-proxy.md`.
 - `ARKS_SERVICE_CWT_PATH` is optional. When set, the file's contents are read once at startup and relayed as an `X-Actor-Token` header on every forwarded (proxied) request, so the upstream platform can verify this service as the caller's `act[]` forwarder. An unreadable path, or content that isn't a valid HTTP header value, fails the server at startup rather than per-request — but the file's content is not itself checked to be a real CWT at startup; a syntactically-valid-but-bogus value is only rejected later, per-request, by the upstream platform's own CWT verification. See `src/modules/platform_proxy.rs`.
 
-**Note:** CWT bearer authentication (`CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, `CWT_EXPECTED_AUDIENCE`) gates every non-public route on this server — the `/ws` upgrade, `/kas/v2/rewrap`, all of `/media/v1/*` except `/media/v1/certificate`, and (when built with `--features c2pa_signing`) both `/c2pa/v1/sign` and `/c2pa/v1/validate` — not just WebSocket connections. See "Request authentication" in `PROTOCOL.md` for the full model.
+**Note:** CWT bearer authentication (`CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, `CWT_EXPECTED_AUDIENCE`) gates every non-public route on this server — the `/ws` upgrade, `/kas/v2/rewrap` (when served locally; `KAS_PROXY_MODE=rest` replaces it with an ungated forward to the upstream platform, per the note above), all of `/media/v1/*` except `/media/v1/certificate`, and (when built with `--features c2pa_signing`) both `/c2pa/v1/sign` and `/c2pa/v1/validate` — not just WebSocket connections. See "Request authentication" in `PROTOCOL.md` for the full model.
 
 **Note:** For HTTP/3 (QUIC) support:
 - Optional and disabled unless built with `--features http3`.
