@@ -95,8 +95,9 @@ The server can be configured using environment variables. If not set, default va
 | TLS_CERT_PATH        | Path to the TLS certificate file         | ./fullchain.pem             |
 | TLS_KEY_PATH         | Path to the TLS private key file         | ./privkey.pem               |
 | KAS_KEY_PATH         | Path to the KAS private key file         | ./recipient_private_key.pem |
-| JWT_VALIDATION_DISABLED | Disable JWT signature validation (dev only) | true                        |
-| JWT_PUBLIC_KEY_PATH  | Path to JWT public key (if validation enabled) | -                           |
+| CWT_KEYS_URL         | COSE key set URL for WebSocket CWT validation | https://identity.arkavo.net/.well-known/cose-keys |
+| CWT_EXPECTED_ISSUER  | Expected CWT issuer for WebSocket auth   | https://identity.arkavo.net |
+| CWT_EXPECTED_AUDIENCE | Expected CWT audience for WebSocket auth | https://100.arkavo.net |
 | NATS_URL             | URL for NATS connection                  | nats://localhost:4222       |
 | NATS_SUBJECT         | Default NATS subscription subject        | nanotdf.messages            |
 | REDIS_URL            | URL for Redis connection                 | redis://localhost:6379      |
@@ -105,15 +106,16 @@ The server can be configured using environment variables. If not set, default va
 
 All file paths are relative to the current working directory where the server is run.
 
-**Security Note:** For production deployments, set `JWT_VALIDATION_DISABLED=false` and provide a public key via `JWT_PUBLIC_KEY_PATH` to enable proper JWT signature verification.
+**Security Note:** WebSocket clients must present a valid CWT signed by a key from `CWT_KEYS_URL`.
 
 ```env
 export PORT=8443
 export TLS_CERT_PATH=/path/to/fullchain.pem
 export TLS_KEY_PATH=/path/to/privkey.pem
 export KAS_KEY_PATH=/path/to/recipient_private_key.pem
-export JWT_VALIDATION_DISABLED=false
-export JWT_PUBLIC_KEY_PATH=/path/to/jwt_public_key.pem
+export CWT_KEYS_URL=https://identity.arkavo.net/.well-known/cose-keys
+export CWT_EXPECTED_ISSUER=https://identity.arkavo.net
+export CWT_EXPECTED_AUDIENCE=https://100.arkavo.net
 export NATS_URL=nats://localhost:4222
 export NATS_SUBJECT=nanotdf.messages
 export REDIS_URL=redis://localhost:6379

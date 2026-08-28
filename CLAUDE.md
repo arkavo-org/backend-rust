@@ -228,6 +228,9 @@ export NATS_SUBJECT=nanotdf.messages
 export REDIS_URL=redis://localhost:6379
 export ENABLE_TIMING_LOGS=true                     # Performance logging
 export RUST_LOG=info                               # Logging level
+export CWT_KEYS_URL=https://identity.arkavo.net/.well-known/cose-keys  # WebSocket CWT keys
+export CWT_EXPECTED_ISSUER=https://identity.arkavo.net                 # WebSocket CWT issuer
+export CWT_EXPECTED_AUDIENCE=https://100.arkavo.net                    # WebSocket CWT audience
 
 # Media DRM Configuration
 export MAX_CONCURRENT_STREAMS=5                    # Max simultaneous streams per user
@@ -252,9 +255,6 @@ export CHAIN_RPC_URL=ws://chain.arkavo.net          # Optional, disables chain v
 export OPENTDF_PLATFORM_URL=https://platform.svc:8443  # Upstream platform base URL
 export KAS_PROXY_MODE=connect                          # off | connect | rest | both
 export AUTHZ_PROXY=on                                  # Forward /authorization.v2.* to platform (independent of KAS_PROXY_MODE)
-
-# NanoTDF /ws token audience
-export NTDF_EXPECTED_AUDIENCE=https://platform.arkavo.net  # Exact-match `aud` on /ws CWTs; default shown
 
 # HTTP/3 (requires --features http3)
 export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin to the public interface on a multi-homed host
@@ -290,12 +290,6 @@ export H3_BIND_HOST=0.0.0.0                            # QUIC bind address; pin 
 - `rest` forwards `/kas/v2/rewrap` and `/kas/v2/kas_public_key`, replacing the local OpenTDF-compat shim.
 - `both` forwards all of the above.
 - `/ws` (NanoTDF) always stays local. See `docs/platform-proxy.md`.
-
-**Note:** For the NanoTDF `/ws` token audience:
-- `NTDF_EXPECTED_AUDIENCE` is compared with an exact string match against the token's `aud`.
-- Default is `https://platform.arkavo.net`. A client still presenting a token minted for a
-  retired hostname gets `401 Invalid NTDF token` with no fallback — pin this variable to the
-  old audience to bridge a rollout. See `docs/hostname-policy.md`.
 
 **Note:** For HTTP/3 (QUIC) support:
 - Optional and disabled unless built with `--features http3`.

@@ -17,9 +17,7 @@ This implementation uses a **custom binary protocol over WebSocket** rather than
 ```
 Client                                  Server
   |                                       |
-  |-------- WebSocket Connect ---------->|
-  |                                       |
-  |-------- JWT Token (Text) ----------->|  (Optional, for authentication)
+  |-------- WebSocket Connect ---------->|  (Authorization: Bearer <CWT>)
   |                                       |
   |-------- PublicKey (0x01) ----------->|  (ECDH key agreement)
   |<------- PublicKey (0x01) -------------|  (with salt)
@@ -57,22 +55,21 @@ All binary messages use a single-byte type prefix:
 
 ## Authentication
 
-### JWT Token (Text Message)
+### CWT Bearer Token
 
-Before any binary operations, clients should send a text message containing a JWT token:
+The WebSocket upgrade requires an `Authorization` header containing a base64url-encoded
+COSE_Sign1 CWT:
 
-```json
-{
-  "sub": "user_public_id",
-  "age": "Verified 18+"
-}
+```http
+Authorization: Bearer <base64url-cose-sign1-cwt>
 ```
 
 **Configuration:**
-- `JWT_VALIDATION_DISABLED=true` (default): Accepts any JWT without verification
-- `JWT_VALIDATION_DISABLED=false`: Validates signature using public key from `JWT_PUBLIC_KEY_PATH`
+- `CWT_KEYS_URL`: COSE key set endpoint for signature verification
+- `CWT_EXPECTED_ISSUER`: required `iss` claim
+- `CWT_EXPECTED_AUDIENCE`: required `aud` claim
 
-**Supported Algorithms:** RS256, RS384, RS512, ES256, ES384
+**Supported Algorithm:** ES256 over P-256 COSE keys
 
 ## ECDH Key Agreement (0x01)
 
@@ -332,7 +329,7 @@ HKDF-SHA256(
 |---------|------------------|---------------------|
 | Transport | REST/HTTP | WebSocket |
 | Protocol | JSON | Custom Binary |
-| Authentication | Bearer Token (HTTP header) | JWT (WebSocket text message) |
+| Authentication | Bearer Token (HTTP header) | CWT Bearer token (WebSocket upgrade) |
 | Rewrap Endpoint | POST /kas/v2/rewrap | Binary message type 0x03 |
 | Key Agreement | Per-request or cached | Session-based ECDH |
 | Push Events | Not supported | NATS pub/sub + type 0x05/0x06 |
@@ -341,7 +338,7 @@ HKDF-SHA256(
 
 ## Testing Recommendations
 
-1. **JWT Configuration:** Set `JWT_VALIDATION_DISABLED=true` for initial testing
+1. **CWT Configuration:** Set `CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, and `CWT_EXPECTED_AUDIENCE` for WebSocket authentication
 2. **NATS Availability:** Ensure NATS server is running or expect NATS-related errors
 3. **Redis Caching:** Events require Redis for UserEvent/CacheEvent
 4. **Test Vectors:** Use OpenTDF NanoTDF test vectors for rewrap validation
@@ -383,8 +380,9 @@ S→C: [0xFF]{"error_type":"invalid_format","message":"Session not established -
 | TLS_CERT_PATH | ./fullchain.pem | TLS certificate (optional) |
 | TLS_KEY_PATH | ./privkey.pem | TLS private key (optional) |
 | KAS_KEY_PATH | ./recipient_private_key.pem | KAS EC private key (required) |
-| JWT_VALIDATION_DISABLED | true | Disable JWT signature verification |
-| JWT_PUBLIC_KEY_PATH | - | JWT verification public key (if validation enabled) |
+| CWT_KEYS_URL | https://identity.arkavo.net/.well-known/cose-keys | COSE key set URL for WebSocket CWT validation |
+| CWT_EXPECTED_ISSUER | https://identity.arkavo.net | Required CWT issuer |
+| CWT_EXPECTED_AUDIENCE | https://100.arkavo.net | Required CWT audience |
 | NATS_URL | nats://localhost:4222 | NATS server URL |
 | NATS_SUBJECT | nanotdf.messages | Default NATS subscription subject |
 | REDIS_URL | redis://localhost:6379 | Redis connection string |

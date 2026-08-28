@@ -10,7 +10,7 @@ mod modules;
 
 #[cfg(feature = "c2pa_signing")]
 use modules::c2pa_signing;
-use modules::{authzen, cbor_protocol, http_rewrap, media_api, ntdf_token, platform_proxy};
+use modules::{authzen, cbor_protocol, cwt_token, http_rewrap, media_api, platform_proxy};
 use opentdf_kas::{
     compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
 };
@@ -33,7 +33,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use flatbuffers::root;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, DecodingKey, Validation};
 use log::{error, info, warn};
 use nanotdf::{BinaryParser, PolicyType, ProtocolEnum, ResourceLocator};
 use once_cell::sync::OnceCell;
@@ -119,8 +118,6 @@ struct ConnectionState {
     salt_lock: RwLock<Option<Vec<u8>>>,
     shared_secret_lock: RwLock<Option<Vec<u8>>>,
     claims_lock: RwLock<Option<Claims>>,
-    #[allow(dead_code)] // Used for future policy enforcement
-    ntdf_claims_lock: RwLock<Option<ntdf_token::NtdfTokenPayload>>,
     outgoing_tx: mpsc::UnboundedSender<Message>,
 }
 
@@ -130,22 +127,14 @@ impl ConnectionState {
             salt_lock: RwLock::new(None),
             shared_secret_lock: RwLock::new(None),
             claims_lock: RwLock::new(None),
-            ntdf_claims_lock: RwLock::new(None),
             outgoing_tx,
         }
     }
 
-    fn new_with_ntdf_claims(
-        outgoing_tx: mpsc::UnboundedSender<Message>,
-        ntdf_claims: ntdf_token::NtdfTokenPayload,
-    ) -> Self {
-        ConnectionState {
-            salt_lock: RwLock::new(None),
-            shared_secret_lock: RwLock::new(None),
-            claims_lock: RwLock::new(None),
-            ntdf_claims_lock: RwLock::new(Some(ntdf_claims)),
-            outgoing_tx,
-        }
+    fn new_with_claims(outgoing_tx: mpsc::UnboundedSender<Message>, claims: Claims) -> Self {
+        let state = Self::new(outgoing_tx);
+        *state.claims_lock.write().unwrap() = Some(claims);
+        state
     }
 }
 
@@ -262,76 +251,43 @@ async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Check for NTDF token in Authorization header
-    if let Some(auth_header) = headers.get(AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("NTDF ") {
-                // Validate NTDF token
-                match get_kas_private_key_bytes() {
-                    Some(kas_key_bytes) => {
-                        let kas_key_array: [u8; 32] = match kas_key_bytes.try_into() {
-                            Ok(arr) => arr,
-                            Err(_) => {
-                                warn!("Invalid KAS private key length");
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Server configuration error",
-                                )
-                                    .into_response();
-                            }
-                        };
-                        let kas_private_key = match SecretKey::from_bytes(&kas_key_array.into()) {
-                            Ok(key) => key,
-                            Err(_) => {
-                                warn!("Invalid KAS private key");
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Server configuration error",
-                                )
-                                    .into_response();
-                            }
-                        };
+    let Some(auth_header) = headers.get(AUTHORIZATION) else {
+        return (StatusCode::UNAUTHORIZED, "Missing Bearer CWT").into_response();
+    };
+    let Ok(auth_str) = auth_header.to_str() else {
+        return (StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response();
+    };
 
-                        match ntdf_token::validate_ntdf_token(
-                            auth_str,
-                            &kas_private_key,
-                            &state.server_state.settings.ntdf_expected_audience,
-                        ) {
-                            Ok(claims) => {
-                                info!("NTDF token validated: sub_id={}", claims.sub_id_hex());
-                                return ws
-                                    .on_upgrade(move |socket| {
-                                        handle_websocket_axum_with_ntdf(socket, state, claims)
-                                    })
-                                    .into_response();
-                            }
-                            Err(e) => {
-                                warn!("NTDF token validation failed: {:?}", e);
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    format!("Invalid NTDF token: {}", e),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("KAS private key not initialized");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "Server not ready")
-                            .into_response();
-                    }
-                }
-            }
+    let cwt_claims = match state
+        .cwt_validator
+        .validate_authorization_header(auth_str)
+        .await
+    {
+        Ok(claims) => claims,
+        Err(e) => {
+            warn!("CWT validation failed: {}", e);
+            return (StatusCode::UNAUTHORIZED, "Invalid CWT").into_response();
         }
-    }
+    };
+    info!(
+        "CWT token validated: sub={}, iss={}, aud={}",
+        cwt_claims.subject, cwt_claims.issuer, cwt_claims.audience
+    );
+    let claims = Claims {
+        sub: cwt_claims.subject,
+        age: String::new(),
+    };
 
-    // No NTDF token - allow for backward compatibility
-    ws.on_upgrade(move |socket| handle_websocket_axum(socket, state))
+    ws.on_upgrade(move |socket| handle_websocket_axum(socket, state, Some(claims)))
         .into_response()
 }
 
 /// Handle WebSocket connection using Axum's WebSocket type
-async fn handle_websocket_axum(ws: WebSocket, state: Arc<WebSocketState>) {
+async fn handle_websocket_axum(
+    ws: WebSocket,
+    state: Arc<WebSocketState>,
+    initial_claims: Option<Claims>,
+) {
     // Split the WebSocket into sender and receiver
     let (mut ws_sender, mut ws_receiver) = ws.split();
 
@@ -339,7 +295,10 @@ async fn handle_websocket_axum(ws: WebSocket, state: Arc<WebSocketState>) {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
 
     // Create ConnectionState with the outgoing channel
-    let connection_state = Arc::new(ConnectionState::new(outgoing_tx));
+    let connection_state = Arc::new(match initial_claims.clone() {
+        Some(claims) => ConnectionState::new_with_claims(outgoing_tx, claims),
+        None => ConnectionState::new(outgoing_tx),
+    });
 
     // Set up NATS subscription for this connection
     let nats_task = tokio::spawn(handle_nats_subscription(
@@ -348,7 +307,15 @@ async fn handle_websocket_axum(ws: WebSocket, state: Arc<WebSocketState>) {
         connection_state.clone(),
     ));
 
-    let mut public_id_nats_task: Option<tokio::task::JoinHandle<()>> = None;
+    let public_id_nats_task: Option<tokio::task::JoinHandle<()>> = initial_claims.map(|claims| {
+        let subject = format!("profile.{}", claims.sub);
+        info!("Subscribing to user subject: {}", subject);
+        tokio::spawn(handle_nats_subscription(
+            state.nats_connection.clone(),
+            subject,
+            connection_state.clone(),
+        ))
+    });
 
     // Spawn task to forward outgoing messages
     let outgoing_task = tokio::spawn(async move {
@@ -377,133 +344,11 @@ async fn handle_websocket_axum(ws: WebSocket, state: Arc<WebSocketState>) {
                         println!("Received a close message.");
                         break;
                     }
-                    AxumMessage::Text(token) => {
-                        // Handle JWT token
-                        println!("token: {}", token);
-                        match verify_token(&token, &state.server_state.settings) {
-                            Ok(claims) => {
-                                println!("Valid JWT received. Claims: {:?}", claims);
-                                // Store the claims
-                                {
-                                    let mut claims_lock =
-                                        connection_state.claims_lock.write().unwrap();
-                                    *claims_lock = Some(claims.clone());
-                                }
-                                // Extract publicID from claims and subscribe to `profile.<publicID>`
-                                let public_id = claims.sub;
-                                let subject = format!("profile.{}", public_id);
-                                // Cancel any existing `publicID`-specific NATS task
-                                if let Some(task) = public_id_nats_task.take() {
-                                    task.abort();
-                                }
-                                // Set up new NATS subscription for `profile.<publicID>`
-                                public_id_nats_task = Some(tokio::spawn(handle_nats_subscription(
-                                    state.nats_connection.clone(),
-                                    subject,
-                                    connection_state.clone(),
-                                )));
-                            }
-                            Err(e) => {
-                                error!("Invalid JWT: {}", e);
-                            }
-                        }
-                    }
-                    AxumMessage::Binary(data) => {
-                        // Handle binary message
-                        if let Some(response) = handle_binary_message(
-                            &connection_state,
-                            &state.server_state,
-                            data,
-                            state.nats_connection.clone(),
-                        )
-                        .await
-                        {
-                            // Convert tokio_tungstenite Message to Axum message and send via channel
-                            let _ = connection_state.outgoing_tx.send(response);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                eprintln!("Error reading message: {}", e);
-                break;
-            }
-        }
-    }
-
-    // Cancel the NATS subscription when the WebSocket connection closes
-    nats_task.abort();
-    if let Some(task) = public_id_nats_task {
-        task.abort();
-    }
-    outgoing_task.abort();
-}
-
-/// Handle WebSocket connection with pre-validated NTDF claims
-async fn handle_websocket_axum_with_ntdf(
-    ws: WebSocket,
-    state: Arc<WebSocketState>,
-    ntdf_claims: ntdf_token::NtdfTokenPayload,
-) {
-    // Split the WebSocket into sender and receiver
-    let (mut ws_sender, mut ws_receiver) = ws.split();
-
-    // Create channel for outgoing messages
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
-
-    // Create ConnectionState with NTDF claims
-    let connection_state = Arc::new(ConnectionState::new_with_ntdf_claims(
-        outgoing_tx,
-        ntdf_claims.clone(),
-    ));
-
-    // Set up NATS subscription for this connection
-    let nats_task = tokio::spawn(handle_nats_subscription(
-        state.nats_connection.clone(),
-        state.server_state.settings.nats_subject.clone(),
-        connection_state.clone(),
-    ));
-
-    // Subscribe to user-specific subject based on sub_id from NTDF token
-    let user_subject = format!("profile.{}", ntdf_claims.sub_id_hex());
-    info!("Subscribing to user subject: {}", user_subject);
-    let public_id_nats_task = Some(tokio::spawn(handle_nats_subscription(
-        state.nats_connection.clone(),
-        user_subject,
-        connection_state.clone(),
-    )));
-
-    // Spawn task to forward outgoing messages
-    let outgoing_task = tokio::spawn(async move {
-        while let Some(msg) = outgoing_rx.recv().await {
-            // Convert tokio_tungstenite Message to Axum WebSocket message
-            let axum_msg = match msg {
-                Message::Binary(data) => AxumMessage::Binary(data),
-                Message::Text(text) => AxumMessage::Text(text),
-                Message::Close(_) => AxumMessage::Close(None),
-                _ => continue,
-            };
-
-            if ws_sender.send(axum_msg).await.is_err() {
-                eprintln!("Failed to send outgoing message through WebSocket");
-                break;
-            }
-        }
-    });
-
-    // Handle incoming WebSocket messages
-    while let Some(result) = ws_receiver.next().await {
-        match result {
-            Ok(msg) => {
-                match msg {
-                    AxumMessage::Close(_) => {
-                        info!("Received a close message.");
-                        break;
-                    }
-                    AxumMessage::Text(_text) => {
-                        // JWT tokens not needed - already authenticated via NTDF
-                        // Could be used for other text-based messages in the future
+                    AxumMessage::Text(text) => {
+                        info!(
+                            "Ignoring WebSocket text message after CWT authentication ({} bytes)",
+                            text.len()
+                        );
                     }
                     AxumMessage::Binary(data) => {
                         // Handle binary message
@@ -994,6 +839,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_state: server_state.clone(),
         nats_connection: nats_connection.clone(),
         apple_app_site_association: apple_app_site_association.clone(),
+        cwt_validator: Arc::new(cwt_token::CwtValidator::new(
+            settings.cwt_keys_url.clone(),
+            settings.cwt_expected_issuer.clone(),
+            settings.cwt_expected_audience.clone(),
+        )),
     });
 
     // Combine all routers
@@ -1266,69 +1116,6 @@ fn load_rustls_config(
 struct Claims {
     sub: String,
     age: String,
-}
-
-fn verify_token(
-    token: &str,
-    settings: &ServerSettings,
-) -> Result<Claims, jsonwebtoken::errors::Error> {
-    if settings.jwt_validation_disabled {
-        // Development mode - disable signature validation
-        log::warn!(
-            "⚠️  JWT signature validation is DISABLED - for development only! \
-             Set JWT_VALIDATION_DISABLED=false for production."
-        );
-        let token_data = jsonwebtoken::dangerous::insecure_decode::<Claims>(token)?;
-        Ok(token_data.claims)
-    } else {
-        // Production mode - proper JWT validation
-        let mut validation = Validation::default();
-        validation.validate_exp = true;
-        validation.validate_aud = false; // Can be enabled if audience is specified
-
-        // Load the public key for verification
-        let public_key_path = settings.jwt_public_key_path.as_ref().ok_or_else(|| {
-            jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
-        })?;
-
-        let public_key_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
-            error!(
-                "Failed to read JWT public key from {}: {}",
-                public_key_path, e
-            );
-            jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
-        })?;
-
-        // Support both RSA and ECDSA keys
-        let decoding_key = if public_key_pem.contains("BEGIN RSA PUBLIC KEY")
-            || public_key_pem.contains("BEGIN PUBLIC KEY")
-        {
-            validation.algorithms = vec![
-                jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::Algorithm::RS384,
-                jsonwebtoken::Algorithm::RS512,
-            ];
-            DecodingKey::from_rsa_pem(public_key_pem.as_bytes())?
-        } else if public_key_pem.contains("BEGIN EC PUBLIC KEY") {
-            validation.algorithms = vec![
-                jsonwebtoken::Algorithm::ES256,
-                jsonwebtoken::Algorithm::ES384,
-            ];
-            DecodingKey::from_ec_pem(public_key_pem.as_bytes())?
-        } else {
-            error!("Unsupported JWT public key format");
-            return Err(jsonwebtoken::errors::Error::from(
-                jsonwebtoken::errors::ErrorKind::InvalidKeyFormat,
-            ));
-        };
-
-        let token_data = decode::<Claims>(token, &decoding_key, &validation)?;
-        info!(
-            "JWT signature verified successfully for subject: {}",
-            token_data.claims.sub
-        );
-        Ok(token_data.claims)
-    }
 }
 
 async fn handle_binary_message(
@@ -2833,6 +2620,7 @@ struct WebSocketState {
     server_state: Arc<ServerState>,
     nats_connection: Arc<NatsConnection>,
     apple_app_site_association: Arc<RwLock<String>>,
+    cwt_validator: Arc<cwt_token::CwtValidator>,
 }
 
 impl ServerState {
@@ -2868,13 +2656,12 @@ struct ServerSettings {
     nats_url: String,
     nats_subject: String,
     redis_url: String,
-    jwt_validation_disabled: bool,
-    jwt_public_key_path: Option<String>,
     s3_bucket: String,
     /// Chain RPC URL for blockchain connectivity (optional - disables chain validation if not set)
     chain_rpc_url: Option<String>,
-    /// Expected audience for NTDF token validation
-    ntdf_expected_audience: String,
+    cwt_keys_url: String,
+    cwt_expected_issuer: String,
+    cwt_expected_audience: String,
 }
 
 fn log_timing(settings: &ServerSettings, message: &str, duration: std::time::Duration) {
@@ -2918,15 +2705,14 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
         nats_url: env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
         nats_subject: env::var("NATS_SUBJECT").unwrap_or_else(|_| "nanotdf.messages".to_string()),
         redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
-        jwt_validation_disabled: env::var("JWT_VALIDATION_DISABLED")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true),
-        jwt_public_key_path: env::var("JWT_PUBLIC_KEY_PATH").ok(),
         s3_bucket: env::var("S3_BUCKET").unwrap_or_else(|_| "default-bucket".to_string()),
         chain_rpc_url: env::var("CHAIN_RPC_URL").ok(),
-        ntdf_expected_audience: env::var("NTDF_EXPECTED_AUDIENCE")
-            .unwrap_or_else(|_| "https://platform.arkavo.net".to_string()),
+        cwt_keys_url: env::var("CWT_KEYS_URL")
+            .unwrap_or_else(|_| "https://identity.arkavo.net/.well-known/cose-keys".to_string()),
+        cwt_expected_issuer: env::var("CWT_EXPECTED_ISSUER")
+            .unwrap_or_else(|_| "https://identity.arkavo.net".to_string()),
+        cwt_expected_audience: env::var("CWT_EXPECTED_AUDIENCE")
+            .unwrap_or_else(|_| "https://100.arkavo.net".to_string()),
     })
 }
 
@@ -2988,16 +2774,6 @@ fn validate_config(settings: &ServerSettings) -> Result<(), Box<dyn std::error::
         .into());
     }
 
-    // Validate JWT configuration
-    if !settings.jwt_validation_disabled && settings.jwt_public_key_path.is_none() {
-        return Err("JWT_PUBLIC_KEY_PATH must be set when JWT validation is enabled".into());
-    }
-    if let Some(ref jwt_key_path) = settings.jwt_public_key_path {
-        if !std::path::Path::new(jwt_key_path).exists() {
-            return Err(format!("JWT public key file not found: {}", jwt_key_path).into());
-        }
-    }
-
     // Validate S3 bucket name
     if settings.s3_bucket.is_empty() {
         return Err("S3_BUCKET must not be empty".into());
@@ -3016,6 +2792,16 @@ fn validate_config(settings: &ServerSettings) -> Result<(), Box<dyn std::error::
             )
             .into());
         }
+    }
+
+    if settings.cwt_keys_url.is_empty() {
+        return Err("CWT_KEYS_URL must not be empty".into());
+    }
+    if settings.cwt_expected_issuer.is_empty() {
+        return Err("CWT_EXPECTED_ISSUER must not be empty".into());
+    }
+    if settings.cwt_expected_audience.is_empty() {
+        return Err("CWT_EXPECTED_AUDIENCE must not be empty".into());
     }
 
     info!("✓ Configuration validation passed");
