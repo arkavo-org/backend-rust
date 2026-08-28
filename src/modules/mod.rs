@@ -3,6 +3,7 @@ pub mod authzen;
 pub mod c2pa_signing;
 pub mod cbor_protocol;
 pub mod crypto;
+pub mod cwt_auth;
 pub mod cwt_token;
 pub mod fairplay;
 #[cfg(feature = "http3")]

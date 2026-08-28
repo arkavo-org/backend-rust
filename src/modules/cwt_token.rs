@@ -2,7 +2,7 @@
 
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use coset::cwt::{ClaimsSet, Timestamp};
+use ciborium::value::Value;
 use coset::iana;
 use coset::{
     Algorithm, CborSerializable, CoseKey, CoseKeySet, CoseSign1, RegisteredLabelWithPrivate,
@@ -19,12 +19,28 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 const DEFAULT_KEY_CACHE_TTL: Duration = Duration::from_secs(600);
+/// Minimum interval between forced key-set refreshes triggered by an
+/// `UnknownKeyId`. Without this, a flood of tokens carrying a bogus `kid`
+/// turns into one upstream GET per request. Trade-off: a genuine key
+/// rotation can 401 for up to this long.
+const FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct CwtClaims {
     pub subject: String,
     pub issuer: String,
     pub audience: String,
+    // Read by `cwt_auth::require_cwt`, which nothing mounts yet — a later
+    // change hangs it on the rewrap and media routers. Until then clippy
+    // `--bin arks` without `--tests` would treat these as dead.
+    /// RFC 8693 `act` chain: the `sub` of each actor that forwarded this
+    /// token, innermost first.
+    #[allow(dead_code)]
+    pub actors: Vec<String>,
+    #[allow(dead_code)]
+    pub account_id: Option<String>,
+    #[allow(dead_code)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +92,21 @@ pub struct CwtValidator {
 struct CachedKeySet {
     keys: Vec<CoseKey>,
     expires_at: Option<Instant>,
+    /// Set whenever a forced refresh actually reaches the network. Guards
+    /// against a flood of bad-`kid` tokens each triggering their own GET.
+    last_forced_refresh: Option<Instant>,
+}
+
+/// Build the reqwest client used to fetch the COSE key set. A bounded
+/// timeout is required: `validate_authorization_header` awaits this inline,
+/// so a hung `CWT_KEYS_URL` would otherwise stall every gated request
+/// forever.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 impl CwtValidator {
@@ -84,7 +115,7 @@ impl CwtValidator {
             keys_url,
             expected_issuer,
             expected_audience,
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             cache: Arc::new(RwLock::new(CachedKeySet::default())),
         }
     }
@@ -99,16 +130,25 @@ impl CwtValidator {
             keys_url: "http://localhost/.well-known/cose-keys".to_string(),
             expected_issuer,
             expected_audience,
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             cache: Arc::new(RwLock::new(CachedKeySet {
                 keys: key_set.0,
                 expires_at: Some(Instant::now() + DEFAULT_KEY_CACHE_TTL),
+                last_forced_refresh: None,
             })),
         }
     }
 
     pub async fn refresh_keys(&self, force: bool) -> Result<(), CwtTokenError> {
-        if !force {
+        if force {
+            let mut cache = self.cache.write().await;
+            if let Some(last) = cache.last_forced_refresh {
+                if last.elapsed() < FORCED_REFRESH_COOLDOWN {
+                    return Err(CwtTokenError::UnknownKeyId);
+                }
+            }
+            cache.last_forced_refresh = Some(Instant::now());
+        } else {
             let cache = self.cache.read().await;
             if !cache.keys.is_empty()
                 && cache
@@ -175,6 +215,17 @@ impl CwtValidator {
         }
     }
 
+    /// Validate a raw (no `Bearer ` prefix) CWT. Used for `X-Actor-Token`.
+    ///
+    /// Called by `cwt_auth::require_cwt`, which nothing mounts yet — a
+    /// later change hangs it on the rewrap and media routers. Until then
+    /// clippy `--bin arks` without `--tests` would treat this as dead.
+    #[allow(dead_code)]
+    pub async fn validate_bearer(&self, token: &str) -> Result<CwtClaims, CwtTokenError> {
+        self.validate_authorization_header(&format!("Bearer {token}"))
+            .await
+    }
+
     async fn validate_token_with_cached_keys(
         &self,
         token: &str,
@@ -233,8 +284,7 @@ fn validate_token(
         .payload
         .as_deref()
         .ok_or(CwtTokenError::MissingPayload)?;
-    let claims = ClaimsSet::from_slice(payload)
-        .map_err(|e| CwtTokenError::InvalidCoseSign1(format!("invalid CWT claims: {e}")))?;
+    let claims = parse_claims(payload)?;
     validate_claims(claims, expected_issuer, expected_audience)
 }
 
@@ -284,8 +334,150 @@ fn key_id(sign1: &CoseSign1) -> Result<&[u8], CwtTokenError> {
     Err(CwtTokenError::MissingKeyId)
 }
 
+/// `aud` as decoded from CBOR: authnz-rs mints it as a list, but a bare text
+/// value is accepted too.
+enum AudienceClaim {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// Claims as decoded straight off the CBOR wire, before cross-checking
+/// against the expected issuer/audience or the clock.
+#[derive(Default)]
+struct RawClaims {
+    issuer: Option<String>,
+    subject: Option<String>,
+    audience: Option<AudienceClaim>,
+    exp: Option<f64>,
+    nbf: Option<f64>,
+    actors: Vec<String>,
+    account_id: Option<String>,
+    roles: Vec<String>,
+}
+
+/// Decode the CWT claims payload as a CBOR map, by hand.
+///
+/// `coset::cwt::ClaimsSet` models `aud` (CBOR map key `3`) as `Option<String>`
+/// (see `coset` 0.4.2 `src/cwt/mod.rs`). authnz-rs mints `aud` as a CBOR
+/// *array* of the intended audiences, so `ClaimsSet::from_slice` fails
+/// `try_as_string()` on that key and returns `Err` for the *entire* claims
+/// set — every other claim is lost with it. Walking the map ourselves lets
+/// `aud` be either shape, and picks up the `act`/`arkavo_*` text claims in
+/// the same pass.
+///
+/// `coset`'s own claim-name decoding rejects a key that is neither an
+/// integer nor text, and separately polices duplicate keys (`ciborium`
+/// itself does not) — see `authzen::cwt_verify::parse_claims` for the same
+/// hardening applied to the union CWT verifier. Both are preserved here so
+/// this rewrite doesn't loosen what a malformed or adversarial claims map
+/// can get past validation.
+fn parse_claims(payload: &[u8]) -> Result<RawClaims, CwtTokenError> {
+    let value: Value = ciborium::de::from_reader(payload)
+        .map_err(|e| CwtTokenError::InvalidCoseSign1(format!("invalid CWT claims: {e}")))?;
+    let Value::Map(entries) = value else {
+        return Err(CwtTokenError::InvalidCoseSign1(
+            "CWT claims payload is not a map".into(),
+        ));
+    };
+
+    let mut claims = RawClaims::default();
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in entries {
+        let seen_key = match &key {
+            Value::Integer(i) => format!("i:{}", i128::from(*i)),
+            Value::Text(t) => format!("t:{t}"),
+            _ => {
+                return Err(CwtTokenError::InvalidCoseSign1(
+                    "CWT claim key is neither integer nor text".into(),
+                ))
+            }
+        };
+        if !seen.insert(seen_key) {
+            return Err(CwtTokenError::InvalidCoseSign1(
+                "duplicate CWT claim key".into(),
+            ));
+        }
+        match key {
+            // RFC 8392 §3.1 registered claim keys.
+            Value::Integer(i) => match i128::from(i) {
+                1 => {
+                    if let Value::Text(s) = value {
+                        claims.issuer = Some(s);
+                    }
+                }
+                2 => {
+                    if let Value::Text(s) = value {
+                        claims.subject = Some(s);
+                    }
+                }
+                3 => match value {
+                    Value::Text(s) => claims.audience = Some(AudienceClaim::One(s)),
+                    Value::Array(items) => {
+                        claims.audience = Some(AudienceClaim::Many(text_array(items)));
+                    }
+                    _ => {}
+                },
+                4 => claims.exp = numeric_seconds(&value),
+                5 => claims.nbf = numeric_seconds(&value),
+                _ => {}
+            },
+            Value::Text(name) => match name.as_str() {
+                "act" => {
+                    if let Value::Array(items) = value {
+                        for item in items {
+                            if let Value::Map(fields) = item {
+                                for (k, v) in fields {
+                                    if let (Value::Text(k), Value::Text(v)) = (k, v) {
+                                        if k == "sub" {
+                                            claims.actors.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "arkavo_account_id" => {
+                    if let Value::Text(s) = value {
+                        claims.account_id = Some(s);
+                    }
+                }
+                "arkavo_roles" => {
+                    if let Value::Array(items) = value {
+                        claims.roles = text_array(items);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(claims)
+}
+
+/// Drop non-text entries rather than fail the whole decode: an `act`/`aud`
+/// array is meaningful even if one exotic entry can't be read as text.
+fn text_array(items: Vec<Value>) -> Vec<String> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            Value::Text(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// RFC 8392 NumericDate: a CBOR integer or float count of seconds.
+fn numeric_seconds(value: &Value) -> Option<f64> {
+    match value {
+        Value::Integer(i) => i64::try_from(*i).ok().map(|v| v as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
 fn validate_claims(
-    claims: ClaimsSet,
+    claims: RawClaims,
     expected_issuer: &str,
     expected_audience: &str,
 ) -> Result<CwtClaims, CwtTokenError> {
@@ -295,20 +487,25 @@ fn validate_claims(
     }
 
     let subject = claims.subject.ok_or(CwtTokenError::MissingClaim("sub"))?;
-    let audience = claims.audience.ok_or(CwtTokenError::MissingClaim("aud"))?;
-    if audience != expected_audience {
-        return Err(CwtTokenError::AudienceMismatch);
+
+    let audience_claim = claims.audience.ok_or(CwtTokenError::MissingClaim("aud"))?;
+    let audience = match &audience_claim {
+        AudienceClaim::One(a) if a == expected_audience => Some(a.clone()),
+        AudienceClaim::One(_) => None,
+        AudienceClaim::Many(list) => list
+            .iter()
+            .find(|a| a.as_str() == expected_audience)
+            .cloned(),
     }
+    .ok_or(CwtTokenError::AudienceMismatch)?;
 
     let now = current_timestamp()?;
-    let exp = claims
-        .expiration_time
-        .ok_or(CwtTokenError::MissingClaim("exp"))?;
-    if timestamp_seconds(&exp) <= now {
+    let exp = claims.exp.ok_or(CwtTokenError::MissingClaim("exp"))?;
+    if exp <= now {
         return Err(CwtTokenError::Expired);
     }
-    if let Some(nbf) = claims.not_before {
-        if timestamp_seconds(&nbf) > now {
+    if let Some(nbf) = claims.nbf {
+        if nbf > now {
             return Err(CwtTokenError::NotYetValid);
         }
     }
@@ -317,6 +514,9 @@ fn validate_claims(
         subject,
         issuer,
         audience,
+        actors: claims.actors,
+        account_id: claims.account_id,
+        roles: claims.roles,
     })
 }
 
@@ -325,13 +525,6 @@ fn current_timestamp() -> Result<f64, CwtTokenError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| CwtTokenError::InvalidSystemTime)?
         .as_secs_f64())
-}
-
-fn timestamp_seconds(timestamp: &Timestamp) -> f64 {
-    match timestamp {
-        Timestamp::WholeSeconds(value) => *value as f64,
-        Timestamp::FractionalSeconds(value) => *value,
-    }
 }
 
 fn parse_max_age(cache_control: &str) -> Option<Duration> {
@@ -346,6 +539,7 @@ fn parse_max_age(cache_control: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coset::cwt::{ClaimsSet, Timestamp};
     use coset::CoseKeyBuilder;
     use coset::{CoseSign1Builder, HeaderBuilder};
     use p256::ecdsa::signature::Signer;
@@ -410,6 +604,138 @@ mod tests {
         assert!(matches!(err, CwtTokenError::NotYetValid));
     }
 
+    // `validates_happy_path_cwt` above pins the scalar `aud` shape. These two
+    // pin the list-valued shape authnz-rs actually mints (spec §5.1).
+    #[tokio::test]
+    async fn accepts_audience_array_containing_expected() {
+        let (signer, key_set_bytes) = test_support::keypair_and_set();
+        let validator = CwtValidator::from_key_set(
+            ISSUER.to_string(),
+            AUDIENCE.to_string(),
+            parse_key_set(&key_set_bytes).unwrap(),
+        );
+        let token = signer.mint_with_array_aud(
+            &[("iss", ISSUER), ("sub", "test-subject")],
+            &["https://other.example", AUDIENCE],
+        );
+        let claims = validator
+            .validate_authorization_header(&format!("Bearer {token}"))
+            .await
+            .unwrap();
+        assert_eq!(claims.audience, AUDIENCE);
+    }
+
+    #[tokio::test]
+    async fn rejects_audience_array_missing_expected() {
+        let (signer, key_set_bytes) = test_support::keypair_and_set();
+        let validator = CwtValidator::from_key_set(
+            ISSUER.to_string(),
+            AUDIENCE.to_string(),
+            parse_key_set(&key_set_bytes).unwrap(),
+        );
+        let token = signer.mint_with_array_aud(
+            &[("iss", ISSUER), ("sub", "test-subject")],
+            &["https://other.example", "https://another.example"],
+        );
+        let err = validator
+            .validate_authorization_header(&format!("Bearer {token}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CwtTokenError::AudienceMismatch));
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_within_cooldown_is_skipped() {
+        let (_signer, key_set_bytes) = test_support::keypair_and_set();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/cose-keys"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(key_set_bytes, "application/cbor"),
+            )
+            .mount(&mock)
+            .await;
+        let validator = CwtValidator::new(
+            format!("{}/.well-known/cose-keys", mock.uri()),
+            ISSUER.to_string(),
+            AUDIENCE.to_string(),
+        );
+        validator.refresh_keys(true).await.unwrap();
+        // Same-instant retry: the fetch above just ran, so this one must be
+        // skipped by the cooldown rather than hitting the mock again.
+        let err = validator.refresh_keys(true).await.unwrap_err();
+        assert!(matches!(err, CwtTokenError::UnknownKeyId));
+    }
+
+    // `ciborium` does not police duplicate map keys on its own — coset's own
+    // `ClaimsSet::from_cbor_value` does, and the manual walk in `parse_claims`
+    // must preserve that or a token with two `iss` entries would silently
+    // resolve to whichever one the loop saw last.
+    #[tokio::test]
+    async fn rejects_duplicate_claim_key() {
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let kid = vec![1, 2, 3, 4];
+        let public_point = verifying_key.to_encoded_point(false);
+        let x = public_point.x().unwrap().to_vec();
+        let y = public_point.y().unwrap().to_vec();
+        let key = CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x, y)
+            .key_id(kid.clone())
+            .algorithm(iana::Algorithm::ES256)
+            .build();
+        let validator = CwtValidator::from_key_set(
+            ISSUER.to_string(),
+            AUDIENCE.to_string(),
+            CoseKeySet(vec![key]),
+        );
+
+        let payload_map = coset::cbor::value::Value::Map(vec![
+            (
+                coset::cbor::value::Value::Integer(1.into()),
+                coset::cbor::value::Value::Text(ISSUER.to_string()),
+            ),
+            (
+                coset::cbor::value::Value::Integer(1.into()),
+                coset::cbor::value::Value::Text("https://impostor.example".to_string()),
+            ),
+            (
+                coset::cbor::value::Value::Integer(2.into()),
+                coset::cbor::value::Value::Text("test-subject".to_string()),
+            ),
+            (
+                coset::cbor::value::Value::Integer(3.into()),
+                coset::cbor::value::Value::Text(AUDIENCE.to_string()),
+            ),
+            (
+                coset::cbor::value::Value::Integer(4.into()),
+                coset::cbor::value::Value::Integer(now_plus(300).into()),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&payload_map, &mut payload).unwrap();
+        let protected = HeaderBuilder::new()
+            .algorithm(iana::Algorithm::ES256)
+            .key_id(kid.to_vec())
+            .build();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .try_create_signature(b"", |tbs| {
+                let signature: Signature = signing_key.sign(tbs);
+                Ok::<_, CwtTokenError>(signature.to_bytes().to_vec())
+            })
+            .unwrap()
+            .build();
+        let token = URL_SAFE_NO_PAD.encode(sign1.to_tagged_vec().unwrap());
+
+        let err = validator
+            .validate_authorization_header(&format!("Bearer {token}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CwtTokenError::InvalidCoseSign1(_)));
+    }
+
     fn validator_and_token(audience: &str, exp: i64, nbf: Option<i64>) -> (CwtValidator, String) {
         let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
         let verifying_key = signing_key.verifying_key();
@@ -461,6 +787,136 @@ mod tests {
             .unwrap()
             .build();
         URL_SAFE_NO_PAD.encode(sign1.to_tagged_vec().unwrap())
+    }
+
+    fn now_plus(offset_secs: i64) -> i64 {
+        (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            + offset_secs
+    }
+}
+
+/// CWT-minting helpers shared by this module's tests and by
+/// `cwt_auth`'s middleware tests. `pub(crate)` so `cwt_auth.rs` can reach
+/// them under `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use coset::cwt::{ClaimName, ClaimsSet, Timestamp};
+    use coset::{CoseKeyBuilder, CoseSign1Builder, HeaderBuilder};
+    use p256::ecdsa::signature::Signer as _;
+    use p256::ecdsa::{Signature, SigningKey};
+
+    /// Signs test CWTs with an ephemeral ES256 key.
+    pub(crate) struct Signer {
+        key: SigningKey,
+        kid: Vec<u8>,
+    }
+
+    /// A fresh `Signer` plus the CBOR-encoded `CoseKeySet` bytes a validator
+    /// would fetch from `/.well-known/cose-keys` to verify its tokens.
+    pub(crate) fn keypair_and_set() -> (Signer, Vec<u8>) {
+        let signing_key = SigningKey::from_bytes((&[42u8; 32]).into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let kid = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let public_point = verifying_key.to_encoded_point(false);
+        let x = public_point.x().unwrap().to_vec();
+        let y = public_point.y().unwrap().to_vec();
+        let key = CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x, y)
+            .key_id(kid.clone())
+            .algorithm(iana::Algorithm::ES256)
+            .build();
+        let set_bytes = CoseKeySet(vec![key]).to_vec().unwrap();
+        (
+            Signer {
+                key: signing_key,
+                kid,
+            },
+            set_bytes,
+        )
+    }
+
+    impl Signer {
+        /// Mint a CWT from `(claim, value)` text pairs. Recognizes `"iss"`,
+        /// `"sub"`, `"aud"`; `exp` is always set to now+300.
+        pub(crate) fn mint(&self, claims: &[(&str, &str)]) -> String {
+            self.build(claims, None, &[])
+        }
+
+        /// Like [`Self::mint`], but also sets `act` to
+        /// `[{"sub": actor}, ...]` for each of `actors`.
+        pub(crate) fn mint_with_act(&self, claims: &[(&str, &str)], actors: &[&str]) -> String {
+            self.build(claims, None, actors)
+        }
+
+        /// Like [`Self::mint`], but `aud` is minted as a CBOR array of
+        /// `audiences` rather than a bare text value (any `"aud"` pair in
+        /// `claims` is ignored). This is the shape authnz-rs actually mints.
+        pub(crate) fn mint_with_array_aud(
+            &self,
+            claims: &[(&str, &str)],
+            audiences: &[&str],
+        ) -> String {
+            self.build(claims, Some(audiences), &[])
+        }
+
+        fn build(
+            &self,
+            claims: &[(&str, &str)],
+            array_aud: Option<&[&str]>,
+            actors: &[&str],
+        ) -> String {
+            let mut set = ClaimsSet {
+                expiration_time: Some(Timestamp::WholeSeconds(now_plus(300))),
+                ..ClaimsSet::default()
+            };
+            for (name, value) in claims {
+                match *name {
+                    "iss" => set.issuer = Some((*value).to_string()),
+                    "sub" => set.subject = Some((*value).to_string()),
+                    "aud" if array_aud.is_none() => set.audience = Some((*value).to_string()),
+                    _ => {}
+                }
+            }
+            if let Some(list) = array_aud {
+                set.rest.push((
+                    ClaimName::Assigned(iana::CwtClaimName::Aud),
+                    Value::Array(list.iter().map(|a| Value::Text((*a).to_string())).collect()),
+                ));
+            }
+            if !actors.is_empty() {
+                let act = Value::Array(
+                    actors
+                        .iter()
+                        .map(|actor| {
+                            Value::Map(vec![(
+                                Value::Text("sub".to_string()),
+                                Value::Text((*actor).to_string()),
+                            )])
+                        })
+                        .collect(),
+                );
+                set.rest.push((ClaimName::Text("act".to_string()), act));
+            }
+
+            let payload = set.to_vec().unwrap();
+            let protected = HeaderBuilder::new()
+                .algorithm(iana::Algorithm::ES256)
+                .key_id(self.kid.clone())
+                .build();
+            let sign1 = CoseSign1Builder::new()
+                .protected(protected)
+                .payload(payload)
+                .try_create_signature(b"", |tbs| {
+                    let signature: Signature = self.key.sign(tbs);
+                    Ok::<_, CwtTokenError>(signature.to_bytes().to_vec())
+                })
+                .unwrap()
+                .build();
+            URL_SAFE_NO_PAD.encode(sign1.to_tagged_vec().unwrap())
+        }
     }
 
     fn now_plus(offset_secs: i64) -> i64 {
