@@ -825,13 +825,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /media/v1/certificate (see `media_api::router`).
     let media_router = media_api::router(media_api_state, cwt_auth.clone());
 
-    // C2PA signing router (optional - only if configured)
+    // C2PA signing router (optional - only if configured).
+    // Both routes require a CWT bearer (see `c2pa_signing::router`).
     #[cfg(feature = "c2pa_signing")]
     let c2pa_router = if let Some(c2pa_state) = c2pa_signing_state {
-        Router::new()
-            .route("/c2pa/v1/sign", post(c2pa_signing::sign_manifest))
-            .route("/c2pa/v1/validate", post(c2pa_signing::validate_manifest))
-            .with_state(c2pa_state)
+        c2pa_signing::router(c2pa_state, cwt_auth.clone())
     } else {
         Router::new() // Empty router if C2PA not configured
     };

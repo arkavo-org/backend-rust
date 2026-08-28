@@ -5,11 +5,13 @@
 ///
 /// This enables efficient workflows where multi-gigabyte video files don't need to be uploaded
 /// for signing - only metadata and pre-computed hashes are transmitted.
+use crate::modules::cwt_auth::{require_cwt, CwtAuthState};
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    routing::post,
+    Json, Router,
 };
 use c2pa::{Builder, HashRange, Reader, SigningAlg};
 use log::{error, info, warn};
@@ -181,6 +183,21 @@ impl C2paSigningState {
     pub fn new(config: C2paConfig) -> Self {
         Self { config }
     }
+}
+
+// ==================== Router ====================
+
+/// C2PA signing routes. Both require a CWT bearer: `/c2pa/v1/sign` signs a
+/// caller-supplied manifest hash with this server's C2PA private key, so an
+/// ungated route would be a signing oracle minting Arkavo-attributed
+/// provenance for anyone who can reach the port. Neither route is in the
+/// spec's public-route list.
+pub fn router(state: Arc<C2paSigningState>, auth: Arc<CwtAuthState>) -> Router {
+    Router::new()
+        .route("/c2pa/v1/sign", post(sign_manifest))
+        .route("/c2pa/v1/validate", post(validate_manifest))
+        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .with_state(state)
 }
 
 // ==================== API Handlers ====================
@@ -969,5 +986,82 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&jumbf_path);
+    }
+}
+
+/// Route-level tests for the CWT gate on the C2PA signing routes.
+///
+/// `/c2pa/v1/sign` signs a caller-supplied hash with the server's C2PA private
+/// key; ungated it is a signing oracle. The 401 is produced by the middleware
+/// before the handler runs, so these need no real signing material — the state
+/// below points at paths that do not exist and is never dereferenced.
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::modules::cwt_token::{test_support, CwtValidator};
+    use tokio::net::TcpListener;
+
+    fn signing_state() -> Arc<C2paSigningState> {
+        Arc::new(C2paSigningState::new(C2paConfig {
+            signing_key_path: "/nonexistent/key.pem".to_string(),
+            signing_cert_path: "/nonexistent/cert.pem".to_string(),
+            _require_validation: false,
+            allowed_creators: vec![],
+        }))
+    }
+
+    async fn spawn() -> (String, wiremock::MockServer) {
+        let (_signer, set) = test_support::keypair_and_set();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/cose-keys"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(set, "application/cbor"),
+            )
+            .mount(&mock)
+            .await;
+        let auth = Arc::new(crate::modules::cwt_auth::CwtAuthState {
+            validator: Arc::new(CwtValidator::new(
+                format!("{}/.well-known/cose-keys", mock.uri()),
+                "https://identity.test".into(),
+                "https://arks.test".into(),
+            )),
+        });
+        let app = router(signing_state(), auth);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), mock)
+    }
+
+    #[tokio::test]
+    async fn both_c2pa_routes_require_a_bearer() {
+        let (base, _mock) = spawn().await;
+        let c = reqwest::Client::new();
+        for path in ["/c2pa/v1/sign", "/c2pa/v1/validate"] {
+            let r = c
+                .post(format!("{base}{path}"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 401, "{path} should require a bearer");
+            // Plain-text body proves the middleware rejected it, not the handler.
+            assert_eq!(r.text().await.unwrap(), "Missing Bearer CWT", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn c2pa_sign_with_invalid_bearer_is_401() {
+        let (base, _mock) = spawn().await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/c2pa/v1/sign"))
+            .bearer_auth("not-a-cwt")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.text().await.unwrap(), "Invalid CWT");
     }
 }
