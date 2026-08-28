@@ -3,13 +3,15 @@
 /// Provides dedicated endpoints optimized for streaming media key delivery,
 /// session management, and rental window tracking.
 use crate::modules::crypto;
+use crate::modules::cwt_auth::{require_cwt, AuthenticatedSubject, CwtAuthState};
 use crate::modules::fairplay::MediaProtocol;
 use crate::modules::http_rewrap::RewrapState;
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    routing::{delete, get, post},
+    Extension, Json, Router,
 };
 #[cfg(feature = "fairplay")]
 use base64::Engine;
@@ -99,7 +101,10 @@ pub struct MediaKeyResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStartRequest {
-    pub user_id: String,
+    /// Optional and advisory only: identity comes from the CWT bearer. When
+    /// present it must equal the authenticated subject, so an existing client
+    /// that still sends its own id cannot start a session as someone else.
+    pub user_id: Option<String>,
     pub asset_id: String,
     pub protocol: Option<MediaProtocol>, // Auto-detected if not specified
     pub geo_region: Option<String>,
@@ -145,6 +150,33 @@ impl IntoResponse for ErrorResponse {
         };
         (status, Json(self)).into_response()
     }
+}
+
+// ==================== Router ====================
+
+/// Media DRM routes.
+///
+/// Every route requires a CWT bearer except `GET /media/v1/certificate`: a
+/// FairPlay client must fetch the application certificate before it can build
+/// an SPC, and the certificate is public data. It is mounted on its own
+/// unlayered router and merged so the auth layer cannot reach it.
+pub fn router(state: Arc<MediaApiState>, auth: Arc<CwtAuthState>) -> Router {
+    let protected = Router::new()
+        .route("/media/v1/key-request", post(media_key_request))
+        .route("/media/v1/session/start", post(session_start))
+        .route(
+            "/media/v1/session/:session_id/heartbeat",
+            post(session_heartbeat),
+        )
+        .route("/media/v1/session/:session_id", delete(session_terminate))
+        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .with_state(state.clone());
+
+    let public = Router::new()
+        .route("/media/v1/certificate", get(fairplay_certificate))
+        .with_state(state);
+
+    protected.merge(public)
 }
 
 // ==================== Helper Functions ====================
@@ -253,10 +285,11 @@ fn extract_dek_from_wrapped_key(
     Ok(dek)
 }
 
-/// Validate session exists and user_id matches
+/// Validate the session exists and belongs to the authenticated subject.
 async fn validate_session(
     state: &MediaApiState,
     payload: &MediaKeyRequest,
+    subject_sub: &str,
     timer: &RequestTimer,
 ) -> Result<PlaybackSession, ErrorResponse> {
     // Verify session exists and update heartbeat
@@ -283,8 +316,9 @@ async fn validate_session(
         }
     };
 
-    // Validate user_id matches session
-    if session.user_id != payload.user_id {
+    // The session must belong to the CWT-authenticated caller. The body's
+    // `user_id` is client-asserted and is never consulted for this check.
+    if session.user_id != subject_sub {
         error!("User ID mismatch for session {}", payload.session_id);
         log_key_request_error(
             state,
@@ -296,7 +330,7 @@ async fn validate_session(
 
         return Err(ErrorResponse {
             error: "authentication_failed".to_string(),
-            message: "User ID does not match session".to_string(),
+            message: "Session does not belong to the authenticated subject".to_string(),
         });
     }
 
@@ -504,6 +538,7 @@ async fn validate_chain_session(
 #[cfg(feature = "fairplay")]
 pub fn media_key_request(
     State(state): State<Arc<MediaApiState>>,
+    Extension(subject): Extension<AuthenticatedSubject>,
     Json(payload): Json<MediaKeyRequest>,
 ) -> Pin<Box<dyn Future<Output = Result<Json<MediaKeyResponse>, ErrorResponse>> + Send>> {
     Box::pin(async move {
@@ -522,9 +557,9 @@ pub fn media_key_request(
 
         // Route to protocol-specific handler
         match protocol {
-            MediaProtocol::TDF3 => handle_tdf3_key_request(state, payload, timer).await,
+            MediaProtocol::TDF3 => handle_tdf3_key_request(state, payload, subject, timer).await,
             MediaProtocol::FairPlay => {
-                handle_fairplay_key_request_router(state, payload, timer).await
+                handle_fairplay_key_request_router(state, payload, subject, timer).await
             }
         }
     })
@@ -535,6 +570,7 @@ pub fn media_key_request(
 #[cfg(not(feature = "fairplay"))]
 pub async fn media_key_request(
     State(state): State<Arc<MediaApiState>>,
+    Extension(subject): Extension<AuthenticatedSubject>,
     Json(payload): Json<MediaKeyRequest>,
 ) -> Result<Json<MediaKeyResponse>, ErrorResponse> {
     let timer = RequestTimer::start();
@@ -559,7 +595,7 @@ pub async fn media_key_request(
         payload.session_id, payload.asset_id, payload.segment_index
     );
 
-    handle_tdf3_key_request(state, payload, timer).await
+    handle_tdf3_key_request(state, payload, subject, timer).await
 }
 
 /// Router for FairPlay requests (handles feature flag)
@@ -568,9 +604,10 @@ pub async fn media_key_request(
 async fn handle_fairplay_key_request_router(
     state: Arc<MediaApiState>,
     payload: MediaKeyRequest,
+    subject: AuthenticatedSubject,
     timer: RequestTimer,
 ) -> Result<Json<MediaKeyResponse>, ErrorResponse> {
-    handle_fairplay_key_request(state, payload, timer).await
+    handle_fairplay_key_request(state, payload, subject, timer).await
 }
 
 #[cfg(not(feature = "fairplay"))]
@@ -578,6 +615,7 @@ async fn handle_fairplay_key_request_router(
 async fn handle_fairplay_key_request_router(
     _state: Arc<MediaApiState>,
     _payload: MediaKeyRequest,
+    _subject: AuthenticatedSubject,
     _timer: RequestTimer,
 ) -> Result<Json<MediaKeyResponse>, ErrorResponse> {
     Err(ErrorResponse {
@@ -590,10 +628,11 @@ async fn handle_fairplay_key_request_router(
 async fn handle_tdf3_key_request(
     state: Arc<MediaApiState>,
     payload: MediaKeyRequest,
+    subject: AuthenticatedSubject,
     timer: RequestTimer,
 ) -> Result<Json<MediaKeyResponse>, ErrorResponse> {
     // 1. Validate session and user
-    let _session = validate_session(&state, &payload, &timer).await?;
+    let _session = validate_session(&state, &payload, &subject.sub, &timer).await?;
 
     // 2. Chain-driven session validation (if configured)
     validate_chain_session(&state, &payload).await?;
@@ -697,10 +736,11 @@ async fn handle_tdf3_key_request(
 async fn handle_fairplay_key_request(
     state: Arc<MediaApiState>,
     payload: MediaKeyRequest,
+    subject: AuthenticatedSubject,
     timer: RequestTimer,
 ) -> Result<Json<MediaKeyResponse>, ErrorResponse> {
     // 1. Validate session and user
-    let session = validate_session(&state, &payload, &timer).await?;
+    let session = validate_session(&state, &payload, &subject.sub, &timer).await?;
 
     // 2. Chain-driven session validation (if configured)
     validate_chain_session(&state, &payload).await?;
@@ -1018,24 +1058,36 @@ pub async fn fairplay_certificate(
 pub async fn session_start(
     State(state): State<Arc<MediaApiState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(subject): Extension<AuthenticatedSubject>,
     Json(payload): Json<SessionStartRequest>,
 ) -> Result<Json<SessionStartResponse>, ErrorResponse> {
+    // Identity is the CWT subject, never the request body. A body `user_id`
+    // is accepted only when it agrees with the authenticated subject.
+    if let Some(claimed) = payload.user_id.as_deref() {
+        if claimed != subject.sub {
+            warn!(
+                "session/start user_id {} does not match authenticated subject {}",
+                claimed, subject.sub
+            );
+            return Err(ErrorResponse {
+                error: "authentication_failed".to_string(),
+                message: "user_id does not match the authenticated subject".to_string(),
+            });
+        }
+    }
+    let user_id = subject.sub.clone();
+
     // Extract real client IP from connection (not from untrusted payload)
     let client_ip = addr.ip().to_string();
     // Generate cryptographically secure session ID with UUID v4
-    let session_id = format!(
-        "{}:{}:{}",
-        payload.user_id,
-        payload.asset_id,
-        Uuid::new_v4()
-    );
+    let session_id = format!("{}:{}:{}", user_id, payload.asset_id, Uuid::new_v4());
 
     // Default to TDF3 for backwards compatibility if protocol not specified
     let protocol = payload.protocol.unwrap_or(MediaProtocol::TDF3);
 
     let session = PlaybackSession {
         session_id: session_id.clone(),
-        user_id: payload.user_id.clone(),
+        user_id: user_id.clone(),
         asset_id: payload.asset_id.clone(),
         protocol,
         segment_index: None,
@@ -1054,7 +1106,7 @@ pub async fn session_start(
             // Publish session start event
             let event = MediaEvent::SessionStart {
                 session_id: session_id.clone(),
-                user_id: payload.user_id.clone(),
+                user_id: user_id.clone(),
                 asset_id: payload.asset_id.clone(),
                 client_ip: client_ip.clone(),
                 geo_region: payload.geo_region.clone(),
@@ -1079,7 +1131,7 @@ pub async fn session_start(
             } = e
             {
                 let event = MediaEvent::ConcurrencyLimit {
-                    user_id: payload.user_id.clone(),
+                    user_id: user_id.clone(),
                     current_streams: current,
                     max_streams: max,
                     timestamp: Utc::now().timestamp(),
@@ -1574,5 +1626,140 @@ B7AXPJ8XPJL5YXPJ8X5cGK8XvB7AQKBgQDpAXPJ8XPJL5YXPJ8X5cGK8XvB7AXPJ
                 extract_dek_from_tdf_manifest(&manifest_b64, &rsa_private_key).unwrap();
             assert_eq!(extracted_dek, test_dek.to_vec());
         }
+    }
+}
+
+/// Route-level tests for the CWT gate on the media router. The interesting
+/// case is the negative one: `/media/v1/certificate` must stay reachable
+/// without a bearer, which the split-router construction is easy to break.
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::modules::cwt_token::{test_support, CwtValidator};
+    use tokio::net::TcpListener;
+
+    const CERT_BYTES: &[u8] = b"fairplay-application-certificate";
+
+    fn media_state() -> Arc<MediaApiState> {
+        let sk = SecretKey::random(&mut OsRng);
+        let pem = public_key_to_pem(&sk.public_key()).unwrap();
+        let redis = Arc::new(redis::Client::open("redis://127.0.0.1:6379/").unwrap());
+        Arc::new(MediaApiState {
+            rewrap_state: Arc::new(RewrapState {
+                kas_ec_private_key: sk,
+                kas_ec_public_key_pem: pem,
+                kas_rsa_private_key: None,
+                kas_rsa_public_key_pem: None,
+                chain_validator: None,
+            }),
+            session_manager: Arc::new(SessionManager::new(redis, Some(5))),
+            media_metrics: Arc::new(MediaMetrics::new(None, "test.metrics".into(), false)),
+            fairplay_handler: None,
+            chain_validator: None,
+            fairplay_certificate_data: Some(Arc::new(CERT_BYTES.to_vec())),
+        })
+    }
+
+    async fn spawn() -> (String, wiremock::MockServer, test_support::Signer) {
+        let (signer, set) = test_support::keypair_and_set();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/cose-keys"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(set, "application/cbor"),
+            )
+            .mount(&mock)
+            .await;
+        let auth = Arc::new(CwtAuthState {
+            validator: Arc::new(CwtValidator::new(
+                format!("{}/.well-known/cose-keys", mock.uri()),
+                "https://identity.test".into(),
+                "https://arks.test".into(),
+            )),
+        });
+        let app = router(media_state(), auth);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        // `session_start` extracts `ConnectInfo` for the real client IP.
+        tokio::spawn(async move {
+            axum::serve(
+                l,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        (format!("http://{addr}"), mock, signer)
+    }
+
+    #[tokio::test]
+    async fn every_media_route_except_certificate_requires_a_bearer() {
+        let (base, _mock, _signer) = spawn().await;
+        let c = reqwest::Client::new();
+        let cases: Vec<reqwest::RequestBuilder> = vec![
+            c.post(format!("{base}/media/v1/key-request"))
+                .json(&serde_json::json!({})),
+            c.post(format!("{base}/media/v1/session/start"))
+                .json(&serde_json::json!({"assetId": "a"})),
+            c.post(format!("{base}/media/v1/session/s1/heartbeat"))
+                .json(&serde_json::json!({})),
+            c.delete(format!("{base}/media/v1/session/s1")),
+        ];
+        for req in cases {
+            let built = req.build().unwrap();
+            let label = format!("{} {}", built.method(), built.url().path());
+            let r = c.execute(built).await.unwrap();
+            assert_eq!(r.status(), 401, "{label} should require a bearer");
+            assert_eq!(r.text().await.unwrap(), "Missing Bearer CWT", "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn certificate_is_reachable_without_a_bearer() {
+        let (base, _mock, _signer) = spawn().await;
+        let r = reqwest::get(format!("{base}/media/v1/certificate"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), CERT_BYTES);
+    }
+
+    /// An authenticated caller may not start a session as somebody else. The
+    /// body's `user_id` is optional; when supplied it must agree with the CWT
+    /// subject. Rejected before any Redis call, so this needs no server.
+    #[tokio::test]
+    async fn session_start_rejects_user_id_that_is_not_the_subject() {
+        let (base, _mock, signer) = spawn().await;
+        let tok = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let r = reqwest::Client::new()
+            .post(format!("{base}/media/v1/session/start"))
+            .bearer_auth(tok)
+            .json(&serde_json::json!({"userId": "someone-else", "assetId": "a"}))
+            .send()
+            .await
+            .unwrap();
+        // `authentication_failed` maps to 401 through the shared ErrorResponse
+        // mapping shared with `validate_session`'s ownership check.
+        assert_eq!(r.status(), 401);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "authentication_failed");
+    }
+
+    #[tokio::test]
+    async fn media_route_with_invalid_bearer_is_401() {
+        let (base, _mock, _signer) = spawn().await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/media/v1/session/start"))
+            .bearer_auth("not-a-cwt")
+            .json(&serde_json::json!({"assetId": "a"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.text().await.unwrap(), "Invalid CWT");
     }
 }

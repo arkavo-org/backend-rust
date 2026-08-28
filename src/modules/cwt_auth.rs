@@ -5,11 +5,10 @@
 //! `X-Actor-Token`, that token's `sub` must be listed in the bearer's `act`
 //! — the forwarder authenticating itself — otherwise 401.
 //!
-//! Not yet mounted on any route in this change; a later change hangs this
-//! on the rewrap and media routers. Until then clippy `--bin arks` without
-//! `--tests` would treat everything here as dead.
-
-#![allow(dead_code)]
+//! Mounted by `http_rewrap::local_router` and `media_api::router`; the public
+//! routes (`/.well-known/apple-app-site-association`,
+//! `/kas/v2/kas_public_key`, `/media/v1/certificate`) sit on unlayered
+//! routers that are merged in alongside.
 
 use crate::modules::cwt_token::{CwtClaims, CwtValidator};
 use axum::{
@@ -26,15 +25,17 @@ pub const ACTOR_TOKEN_HEADER: &str = "x-actor-token";
 
 pub struct CwtAuthState {
     pub validator: Arc<CwtValidator>,
-    /// This service's own identity (matches the `aud` it accepts).
-    pub self_id: String,
 }
 
 /// Verified identity attached to the request as an axum `Extension`.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSubject {
     pub sub: String,
+    // Carried from the CWT for handlers that will need them (entitlement
+    // checks land in a later change); no route reads them yet.
+    #[allow(dead_code)]
     pub account_id: Option<String>,
+    #[allow(dead_code)]
     pub roles: Vec<String>,
     /// `sub` of the authenticated forwarder, when the token was forwarded.
     pub actor: Option<String>,
@@ -149,7 +150,6 @@ mod tests {
         (
             Arc::new(CwtAuthState {
                 validator: Arc::new(validator),
-                self_id: "https://arks.test".into(),
             }),
             signer,
             mock,

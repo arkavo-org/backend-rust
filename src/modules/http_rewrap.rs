@@ -1,10 +1,13 @@
 use crate::modules::crypto;
+use crate::modules::cwt_auth::{require_cwt, AuthenticatedSubject, CwtAuthState};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    routing::{get, post},
+    Extension, Json, Router,
 };
+use chrono::Utc;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use log::{error, info, warn};
 use nanotdf::chain::{ChainValidationRequest, SessionValidator, ValidationError};
@@ -26,7 +29,6 @@ pub struct RewrapState {
     pub kas_ec_public_key_pem: String,
     pub kas_rsa_private_key: Option<RsaPrivateKey>,
     pub kas_rsa_public_key_pem: Option<String>,
-    pub oauth_public_key_pem: Option<String>, // Optional OAuth public key for JWT validation
     pub chain_validator: Option<Arc<dyn SessionValidator>>, // Chain-driven session validator
 }
 
@@ -229,15 +231,14 @@ pub async fn kas_public_key_handler(
 /// POST /kas/v2/rewrap
 pub async fn rewrap_handler(
     State(state): State<Arc<RewrapState>>,
+    Extension(subject): Extension<AuthenticatedSubject>,
     Json(payload): Json<SignedRewrapRequest>,
 ) -> Result<Json<RewrapResponse>, ErrorResponse> {
     info!("Received rewrap request");
 
-    // 1. Verify and decode JWT
-    let unsigned_request = verify_and_decode_jwt(
-        &payload.signed_request_token,
-        state.oauth_public_key_pem.as_deref(),
-    )?;
+    // 1. Verify the request-signature JWT against the client key it embeds.
+    let unsigned_request =
+        verify_signed_request(&payload.signed_request_token, Utc::now().timestamp())?;
 
     // 2. Chain-driven session validation (if configured)
     if let Some(ref validator) = state.chain_validator {
@@ -423,6 +424,10 @@ pub async fn rewrap_handler(
     let mut responses = Vec::new();
 
     for request_entry in unsigned_request.requests {
+        info!(
+            "event=rewrap subject={} actor={:?} policy_id={}",
+            subject.sub, subject.actor, request_entry.policy.id
+        );
         let mut results = Vec::new();
 
         for kao_wrapper in request_entry.key_access_objects {
@@ -590,41 +595,61 @@ fn process_rsa_unwrap(
     Ok(base64::encode(&combined))
 }
 
-/// Verify JWT signature and decode to UnsignedRewrapRequest
-fn verify_and_decode_jwt(
+/// Verify the rewrap `signed_request_token` against the client ephemeral key
+/// embedded in its own `requestBody.clientPublicKey` (the OpenTDF rewrap
+/// protocol's proof-of-possession). Two passes: read the body unverified to
+/// obtain the key, then verify the signature and `exp` with that key.
+///
+/// Caller identity is established separately, by the CWT bearer middleware on
+/// the route; this function only binds the request payload to the client's own
+/// ephemeral key so a captured token cannot be replayed with a substituted key.
+pub fn verify_signed_request(
     token: &str,
-    oauth_public_key_pem: Option<&str>,
+    now: i64,
 ) -> Result<UnsignedRewrapRequest, ErrorResponse> {
+    let invalid = |m: String| ErrorResponse {
+        error: "authentication_failed".to_string(),
+        message: m,
+    };
+    // Pass 1: structure only. Never trusted on its own.
+    // SAFETY-OF-TRUST: structure only; pass 2 verifies with the embedded key.
+    let peek = jsonwebtoken::dangerous::insecure_decode::<JWTClaims>(token) // Pass 1
+        .map_err(|e| invalid(format!("Invalid signed_request_token: {e}")))?;
+    let unsigned: UnsignedRewrapRequest = serde_json::from_str(&peek.claims.request_body)
+        .map_err(|e| invalid(format!("Failed to parse request body: {e}")))?;
+    // Pass 2: bound verification. Everything returned below comes from the
+    // *verified* claims — pass 1's output is discarded.
+    let key = DecodingKey::from_ec_pem(unsigned.client_public_key.as_bytes())
+        .map_err(|e| invalid(format!("clientPublicKey is not a valid EC public key: {e}")))?;
     let mut validation = Validation::new(Algorithm::ES256);
     validation.validate_exp = true;
+    validation.validate_aud = false;
+    validation.leeway = 0;
+    let verified = decode::<JWTClaims>(token, &key, &validation).map_err(|e| {
+        invalid(format!(
+            "signed_request_token signature/exp check failed: {e}"
+        ))
+    })?;
+    if verified.claims.exp <= now {
+        return Err(invalid("signed_request_token expired".into()));
+    }
+    serde_json::from_str(&verified.claims.request_body)
+        .map_err(|e| invalid(format!("Failed to parse request body: {e}")))
+}
 
-    let token_data = if let Some(pem) = oauth_public_key_pem {
-        // Validate signature with provided public key
-        let decoding_key = DecodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| ErrorResponse {
-            error: "configuration_error".to_string(),
-            message: format!("Failed to load OAuth public key: {}", e),
-        })?;
-
-        decode::<JWTClaims>(token, &decoding_key, &validation).map_err(|e| ErrorResponse {
-            error: "authentication_failed".to_string(),
-            message: format!("JWT validation failed: {}", e),
-        })?
-    } else {
-        // Development mode: skip signature validation
-        jsonwebtoken::dangerous::insecure_decode::<JWTClaims>(token).map_err(|e| ErrorResponse {
-            error: "authentication_failed".to_string(),
-            message: format!("Invalid JWT: {}", e),
-        })?
-    };
-
-    // Parse the requestBody JSON string
-    let unsigned_request: UnsignedRewrapRequest =
-        serde_json::from_str(&token_data.claims.request_body).map_err(|e| ErrorResponse {
-            error: "invalid_request".to_string(),
-            message: format!("Failed to parse request body: {}", e),
-        })?;
-
-    Ok(unsigned_request)
+/// OpenTDF-compat routes served locally (i.e. not forwarded to the upstream
+/// platform). `/kas/v2/rewrap` requires a CWT bearer; `/kas/v2/kas_public_key`
+/// is public by design — clients must fetch the KAS key before they hold a
+/// token, so it is mounted on a separate, unlayered router and merged.
+pub fn local_router(state: Arc<RewrapState>, auth: Arc<CwtAuthState>) -> Router {
+    let protected = Router::new()
+        .route("/kas/v2/rewrap", post(rewrap_handler))
+        .layer(axum::middleware::from_fn_with_state(auth, require_cwt))
+        .with_state(state.clone());
+    let public = Router::new()
+        .route("/kas/v2/kas_public_key", get(kas_public_key_handler))
+        .with_state(state);
+    protected.merge(public)
 }
 
 /// Parse PEM-encoded P-256 public key
@@ -654,5 +679,182 @@ mod base64 {
 
     pub fn decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
         STANDARD.decode(data)
+    }
+}
+
+#[cfg(test)]
+mod signed_request_tests {
+    use super::*;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+
+    fn client_key() -> (EncodingKey, String) {
+        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let enc = EncodingKey::from_ec_der(sk.to_pkcs8_der().unwrap().as_bytes());
+        let pem = sk
+            .public_key()
+            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap();
+        (enc, pem)
+    }
+
+    fn token(enc: &EncodingKey, pem: &str, exp: i64) -> String {
+        let body = serde_json::json!({"clientPublicKey": pem, "requests": []}).to_string();
+        let claims = serde_json::json!({"requestBody": body, "iat": exp - 60, "exp": exp});
+        encode(&Header::new(Algorithm::ES256), &claims, enc).unwrap()
+    }
+
+    #[test]
+    fn accepts_token_signed_by_embedded_client_key() {
+        let (enc, pem) = client_key();
+        let now = chrono::Utc::now().timestamp();
+        let req = verify_signed_request(&token(&enc, &pem, now + 120), now).unwrap();
+        assert_eq!(req.client_public_key.trim(), pem.trim());
+    }
+
+    #[test]
+    fn rejects_token_signed_by_other_key() {
+        let (enc_a, _) = client_key();
+        let (_, pem_b) = client_key();
+        let now = chrono::Utc::now().timestamp();
+        assert!(verify_signed_request(&token(&enc_a, &pem_b, now + 120), now).is_err());
+    }
+
+    #[test]
+    fn rejects_expired() {
+        let (enc, pem) = client_key();
+        let now = chrono::Utc::now().timestamp();
+        assert!(verify_signed_request(&token(&enc, &pem, now - 10), now).is_err());
+    }
+}
+
+/// Route-level tests for the CWT gate on `/kas/v2/rewrap` and the public
+/// carve-out for `/kas/v2/kas_public_key`. These exercise the real
+/// `local_router` wiring, not a copy of it — the split-router construction is
+/// exactly what is easy to get wrong.
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::modules::cwt_token::{test_support, CwtValidator};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use tokio::net::TcpListener;
+
+    async fn keys_server() -> (test_support::Signer, wiremock::MockServer) {
+        let (signer, set) = test_support::keypair_and_set();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/cose-keys"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw(set, "application/cbor"),
+            )
+            .mount(&mock)
+            .await;
+        (signer, mock)
+    }
+
+    fn rewrap_state() -> Arc<RewrapState> {
+        let sk = SecretKey::random(&mut OsRng);
+        let pem = public_key_to_pem(&sk.public_key()).unwrap();
+        Arc::new(RewrapState {
+            kas_ec_private_key: sk,
+            kas_ec_public_key_pem: pem,
+            kas_rsa_private_key: None,
+            kas_rsa_public_key_pem: None,
+            chain_validator: None,
+        })
+    }
+
+    async fn spawn() -> (String, test_support::Signer, wiremock::MockServer) {
+        let (signer, mock) = keys_server().await;
+        let auth = Arc::new(CwtAuthState {
+            validator: Arc::new(CwtValidator::new(
+                format!("{}/.well-known/cose-keys", mock.uri()),
+                "https://identity.test".into(),
+                "https://arks.test".into(),
+            )),
+        });
+        let app = local_router(rewrap_state(), auth);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), signer, mock)
+    }
+
+    /// A well-formed `signed_request_token` with no rewrap entries: enough to
+    /// drive the handler to a 200 without needing a real NanoTDF header.
+    fn empty_signed_request() -> String {
+        let sk = p256::SecretKey::random(&mut rand_core::OsRng);
+        let enc = EncodingKey::from_ec_der(sk.to_pkcs8_der().unwrap().as_bytes());
+        let pem = sk
+            .public_key()
+            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap();
+        let exp = chrono::Utc::now().timestamp() + 120;
+        let body = serde_json::json!({"clientPublicKey": pem, "requests": []}).to_string();
+        let claims = serde_json::json!({"requestBody": body, "iat": exp - 60, "exp": exp});
+        encode(&Header::new(Algorithm::ES256), &claims, &enc).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rewrap_without_bearer_is_401() {
+        let (base, _signer, _mock) = spawn().await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .json(&serde_json::json!({"signed_request_token": empty_signed_request()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // Middleware rejection is plain text; a handler rejection would be JSON.
+        assert_eq!(r.text().await.unwrap(), "Missing Bearer CWT");
+    }
+
+    #[tokio::test]
+    async fn rewrap_with_invalid_bearer_is_401() {
+        let (base, _signer, _mock) = spawn().await;
+        let r = reqwest::Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .bearer_auth("not-a-cwt")
+            .json(&serde_json::json!({"signed_request_token": empty_signed_request()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.text().await.unwrap(), "Invalid CWT");
+    }
+
+    #[tokio::test]
+    async fn rewrap_with_valid_bearer_reaches_handler() {
+        let (base, signer, _mock) = spawn().await;
+        let tok = signer.mint(&[
+            ("iss", "https://identity.test"),
+            ("sub", "did:key:z6Mka"),
+            ("aud", "https://arks.test"),
+        ]);
+        let r = reqwest::Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .bearer_auth(tok)
+            .json(&serde_json::json!({"signed_request_token": empty_signed_request()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["responses"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn kas_public_key_stays_public() {
+        let (base, _signer, _mock) = spawn().await;
+        let r = reqwest::get(format!("{base}/kas/v2/kas_public_key"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(body["public_key"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY"));
     }
 }

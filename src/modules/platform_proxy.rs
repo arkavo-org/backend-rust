@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderName, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use reqwest::Client;
 use url::Url;
+
+use crate::modules::cwt_auth::ACTOR_TOKEN_HEADER;
 
 /// Which arks routes get forwarded to opentdf-platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,10 @@ pub struct PlatformProxyState {
     pub client: Client,
     /// Upstream base URL with no trailing slash, e.g. `https://platform.svc:8443`.
     pub upstream_base: String,
+    /// This service's own CWT, sent as `X-Actor-Token` on every forwarded
+    /// request so the upstream can see *who forwarded* the caller's bearer.
+    /// Parsed once at startup: a bad value must fail loudly, not per-request.
+    pub actor_token: Option<HeaderValue>,
 }
 
 impl PlatformProxyState {
@@ -79,6 +85,21 @@ impl PlatformProxyState {
         Ok(Arc::new(Self {
             client,
             upstream_base,
+            actor_token: None,
+        }))
+    }
+
+    /// Attach this service's CWT, relayed as `X-Actor-Token`. The caller's own
+    /// `Authorization` bearer is still forwarded untouched — the upstream
+    /// platform verifies it and uses the actor token to authenticate the
+    /// forwarder against the bearer's `act[]`.
+    pub fn with_actor_token(self: Arc<Self>, token: &str) -> Result<Arc<Self>, String> {
+        let value = HeaderValue::from_str(token.trim())
+            .map_err(|e| format!("service CWT is not a valid header value: {e}"))?;
+        Ok(Arc::new(Self {
+            client: self.client.clone(),
+            upstream_base: self.upstream_base.clone(),
+            actor_token: Some(value),
         }))
     }
 }
@@ -110,6 +131,12 @@ pub async fn proxy(
 
     let mut headers = parts.headers.clone();
     strip_proxy_headers(&mut headers);
+    // Never relay a client-supplied actor token: the actor is *this* service,
+    // and only this service may assert it.
+    headers.remove(HeaderName::from_static(ACTOR_TOKEN_HEADER));
+    if let Some(actor) = state.actor_token.as_ref() {
+        headers.insert(HeaderName::from_static(ACTOR_TOKEN_HEADER), actor.clone());
+    }
 
     let upstream_resp = state
         .client
@@ -202,6 +229,32 @@ mod state_tests {
     fn strips_trailing_slash_from_upstream() {
         let state = PlatformProxyState::new("https://platform.svc/").unwrap();
         assert_eq!(state.upstream_base, "https://platform.svc");
+    }
+
+    #[test]
+    fn no_actor_token_by_default() {
+        let state = PlatformProxyState::new("https://platform.svc").unwrap();
+        assert!(state.actor_token.is_none());
+    }
+
+    #[test]
+    fn actor_token_trims_trailing_newline() {
+        // Reading the CWT from a file leaves a trailing newline, which
+        // `HeaderValue::from_str` rejects outright.
+        let state = PlatformProxyState::new("https://platform.svc")
+            .unwrap()
+            .with_actor_token("d2.abc123\n")
+            .unwrap();
+        assert_eq!(state.actor_token.as_ref().unwrap(), "d2.abc123");
+    }
+
+    #[test]
+    fn actor_token_rejects_invalid_header_value() {
+        let err = PlatformProxyState::new("https://platform.svc")
+            .unwrap()
+            .with_actor_token("bad\u{7f}value")
+            .unwrap_err();
+        assert!(err.contains("not a valid header value"), "got: {err}");
     }
 }
 
@@ -521,5 +574,111 @@ mod header_tests {
         assert!(!headers.contains_key(HeaderName::from_static("x-custom-hop")));
         assert!(!headers.contains_key(header::CONNECTION));
         assert_eq!(headers.get(header::AUTHORIZATION).unwrap(), "Bearer x");
+    }
+}
+
+/// The relay leg of the CWT identity plane: arks forwards the caller's bearer
+/// untouched and asserts *itself* as the forwarder via `X-Actor-Token`.
+#[cfg(test)]
+mod actor_token_tests {
+    use super::*;
+    use axum::{routing::any, Router};
+    use reqwest::Client;
+    use tokio::net::TcpListener;
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    async fn spawn(state: Arc<PlatformProxyState>) -> String {
+        let app = Router::new()
+            .route("/kas/v2/rewrap", any(proxy))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn injects_service_actor_token_and_keeps_caller_bearer() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/kas/v2/rewrap"))
+            .and(header("authorization", "Bearer caller-cwt"))
+            .and(header("x-actor-token", "arks-service-cwt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = PlatformProxyState::new(&upstream.uri())
+            .unwrap()
+            .with_actor_token("arks-service-cwt\n")
+            .unwrap();
+        let base = spawn(state).await;
+
+        let resp = Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .header("authorization", "Bearer caller-cwt")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn overwrites_a_client_supplied_actor_token() {
+        // Only arks may assert who forwarded the request; a client-supplied
+        // X-Actor-Token must never reach the upstream.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/kas/v2/rewrap"))
+            .and(header("x-actor-token", "arks-service-cwt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = PlatformProxyState::new(&upstream.uri())
+            .unwrap()
+            .with_actor_token("arks-service-cwt")
+            .unwrap();
+        let base = spawn(state).await;
+
+        let resp = Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .header("x-actor-token", "forged-by-client")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn strips_client_actor_token_when_service_has_none() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/kas/v2/rewrap"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let state = PlatformProxyState::new(&upstream.uri()).unwrap();
+        let base = spawn(state).await;
+
+        let resp = Client::new()
+            .post(format!("{base}/kas/v2/rewrap"))
+            .header("x-actor-token", "forged-by-client")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // The upstream never saw the forged header.
+        let reqs = upstream.received_requests().await.unwrap();
+        assert!(reqs[0].headers.get("x-actor-token").is_none());
     }
 }

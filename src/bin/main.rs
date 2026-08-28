@@ -10,7 +10,9 @@ mod modules;
 
 #[cfg(feature = "c2pa_signing")]
 use modules::c2pa_signing;
-use modules::{authzen, cbor_protocol, cwt_token, http_rewrap, media_api, platform_proxy};
+use modules::{
+    authzen, cbor_protocol, cwt_auth, cwt_token, http_rewrap, media_api, platform_proxy,
+};
 use opentdf_kas::{
     compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
 };
@@ -341,7 +343,7 @@ async fn handle_websocket_axum(
             Ok(msg) => {
                 match msg {
                     AxumMessage::Close(_) => {
-                        println!("Received a close message.");
+                        info!("Received a close message.");
                         break;
                     }
                     AxumMessage::Text(text) => {
@@ -502,17 +504,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Load OAuth public key from environment if provided
-    let oauth_public_key_pem = env::var("OAUTH_PUBLIC_KEY_PATH")
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok());
-
-    if oauth_public_key_pem.is_some() {
-        info!("OAuth JWT signature validation enabled");
-    } else {
-        info!("OAuth JWT signature validation disabled (development mode)");
-    }
-
     // Load optional RSA key for Standard TDF support
     let (kas_rsa_private_key, kas_rsa_public_key_pem) =
         if let Ok(rsa_key_path) = env::var("KAS_RSA_KEY_PATH") {
@@ -538,7 +529,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kas_ec_public_key_pem: kas_public_key_pem,
         kas_rsa_private_key,
         kas_rsa_public_key_pem,
-        oauth_public_key_pem,
         chain_validator: chain_validator.clone(),
     });
 
@@ -565,6 +555,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(url), true) => {
             let state = platform_proxy::PlatformProxyState::new(&url)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // When arks relays a caller's bearer to the platform it must also
+            // identify itself as the forwarder, so the platform can check the
+            // bearer's `act[]`. Optional: unset means no actor assertion.
+            let state = match env::var("ARKS_SERVICE_CWT_PATH") {
+                Ok(path) => {
+                    let token = std::fs::read_to_string(&path).map_err(
+                        |e| -> Box<dyn std::error::Error> {
+                            format!("ARKS_SERVICE_CWT_PATH {path} unreadable: {e}").into()
+                        },
+                    )?;
+                    info!("Platform proxy will relay X-Actor-Token from {}", path);
+                    state
+                        .with_actor_token(&token)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                }
+                Err(_) => {
+                    info!("ARKS_SERVICE_CWT_PATH not set; forwarding without X-Actor-Token");
+                    state
+                }
+            };
             info!(
                 "Platform proxy enabled: mode={:?}, authz_proxy={}, upstream={}",
                 proxy_mode, authz_proxy, state.upstream_base
@@ -702,9 +712,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _c2pa_signing_state: Option<Arc<()>> = None;
 
     use axum::{
-        routing::{delete, get, post},
+        routing::{get, post},
         Router,
     };
+
+    // One CWT validator for the whole process: the /ws handshake, the bearer
+    // middleware on the rewrap/media routers, and any actor-token check all
+    // share its key cache and its issuer/audience expectations. A second
+    // instance would be a second, drift-prone source of truth.
+    let cwt_validator = Arc::new(cwt_token::CwtValidator::new(
+        settings.cwt_keys_url.clone(),
+        settings.cwt_expected_issuer.clone(),
+        settings.cwt_expected_audience.clone(),
+    ));
+    let cwt_auth = Arc::new(cwt_auth::CwtAuthState {
+        validator: cwt_validator.clone(),
+    });
 
     // OpenTDF compatibility router — either local handlers or forwarded
     // to upstream platform, depending on KAS_PROXY_MODE.
@@ -718,13 +741,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/kas/v2/kas_public_key", get(platform_proxy::proxy))
             .with_state(state)
     } else {
-        Router::new()
-            .route("/kas/v2/rewrap", post(http_rewrap::rewrap_handler))
-            .route(
-                "/kas/v2/kas_public_key",
-                get(http_rewrap::kas_public_key_handler),
-            )
-            .with_state(rewrap_state)
+        // Locally served: /kas/v2/rewrap requires a CWT bearer,
+        // /kas/v2/kas_public_key stays public.
+        http_rewrap::local_router(rewrap_state, cwt_auth.clone())
     };
 
     // Platform discovery — `/.well-known/opentdf-configuration` is published by
@@ -802,23 +821,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
-    // Media DRM router
-    let media_router = Router::new()
-        .route("/media/v1/key-request", post(media_api::media_key_request))
-        .route(
-            "/media/v1/certificate",
-            get(media_api::fairplay_certificate),
-        )
-        .route("/media/v1/session/start", post(media_api::session_start))
-        .route(
-            "/media/v1/session/:session_id/heartbeat",
-            post(media_api::session_heartbeat),
-        )
-        .route(
-            "/media/v1/session/:session_id",
-            delete(media_api::session_terminate),
-        )
-        .with_state(media_api_state);
+    // Media DRM router — every route requires a CWT bearer except
+    // /media/v1/certificate (see `media_api::router`).
+    let media_router = media_api::router(media_api_state, cwt_auth.clone());
 
     // C2PA signing router (optional - only if configured)
     #[cfg(feature = "c2pa_signing")]
@@ -839,11 +844,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_state: server_state.clone(),
         nats_connection: nats_connection.clone(),
         apple_app_site_association: apple_app_site_association.clone(),
-        cwt_validator: Arc::new(cwt_token::CwtValidator::new(
-            settings.cwt_keys_url.clone(),
-            settings.cwt_expected_issuer.clone(),
-            settings.cwt_expected_audience.clone(),
-        )),
+        cwt_validator: cwt_validator.clone(),
     });
 
     // Combine all routers
@@ -1459,22 +1460,13 @@ async fn handle_rewrap(
         if locator.protocol_enum == ProtocolEnum::SharedResource {
             info!("Evaluating contract: {}", locator.body.clone());
             if !locator.body.is_empty() {
-                //  "Verified 18+"
+                // Subject of the authenticated CWT, for ABAC contract checks.
                 let claims_result = match connection_state.claims_lock.read() {
                     Ok(read_lock) => match read_lock.clone() {
                         Some(value) => Ok(value.sub),
                         None => Err("Error: Clone cannot be performed"),
                     },
                     Err(_) => Err("Error: Read lock cannot be obtained"),
-                };
-                let verified_age_result = match connection_state
-                    .claims_lock
-                    .read()
-                    .expect("Error: Read lock cannot be obtained")
-                    .clone()
-                {
-                    Some(claims) => Ok(claims.age == "Verified 18+"),
-                    None => Err("Error: Claims data not available"),
                 };
                 // geo_fence_contract
                 if locator
@@ -1578,11 +1570,11 @@ async fn handle_rewrap(
                     let contract = ContentRating::new();
                     // Parse the content rating data from the policy body
                     // get entitlements
-                    let age_level = if verified_age_result.unwrap_or(false) {
-                        AgeLevel::Adults
-                    } else {
-                        AgeLevel::Kids
-                    };
+                    // Fail-closed: CWTs carry no age claim, so age gating always
+                    // resolves to the most restrictive level. Ruled intended
+                    // behaviour post-NTDF-migration; do not re-add an age claim
+                    // here without a verified source for it.
+                    let age_level = AgeLevel::Kids;
                     if metadata.is_none() {
                         println!("metadata is null");
                         return None;

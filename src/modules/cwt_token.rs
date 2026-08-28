@@ -35,11 +35,8 @@ pub struct CwtClaims {
     // `--bin arks` without `--tests` would treat these as dead.
     /// RFC 8693 `act` chain: the `sub` of each actor that forwarded this
     /// token, innermost first.
-    #[allow(dead_code)]
     pub actors: Vec<String>,
-    #[allow(dead_code)]
     pub account_id: Option<String>,
-    #[allow(dead_code)]
     pub roles: Vec<String>,
 }
 
@@ -227,10 +224,7 @@ impl CwtValidator {
 
     /// Validate a raw (no `Bearer ` prefix) CWT. Used for `X-Actor-Token`.
     ///
-    /// Called by `cwt_auth::require_cwt`, which nothing mounts yet — a
-    /// later change hangs it on the rewrap and media routers. Until then
-    /// clippy `--bin arks` without `--tests` would treat this as dead.
-    #[allow(dead_code)]
+    /// Called by `cwt_auth::require_cwt`.
     pub async fn validate_bearer(&self, token: &str) -> Result<CwtClaims, CwtTokenError> {
         self.validate_authorization_header(&format!("Bearer {token}"))
             .await
