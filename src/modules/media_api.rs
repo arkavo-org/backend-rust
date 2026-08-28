@@ -6,6 +6,7 @@ use crate::modules::crypto;
 use crate::modules::cwt_auth::{require_cwt, AuthenticatedSubject, CwtAuthState};
 use crate::modules::fairplay::MediaProtocol;
 use crate::modules::http_rewrap::RewrapState;
+use crate::modules::secure_keys::SecureEcPrivateKey;
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::StatusCode,
@@ -19,10 +20,8 @@ use chrono::Utc;
 use log::{error, info, warn};
 use nanotdf::chain::{ChainValidationRequest, SessionValidator, ValidationError};
 use nanotdf::BinaryParser;
-use opentdf_kas::{
-    compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
-};
-use p256::{ecdh::EphemeralSecret, PublicKey as P256PublicKey, SecretKey};
+use opentdf_kas::{compute_nanotdf_salt, detect_nanotdf_version, rewrap_dek, NanoTdfVersion};
+use p256::{ecdh::EphemeralSecret, PublicKey as P256PublicKey};
 use rand_core::OsRng;
 #[cfg(feature = "fairplay")]
 use rsa::{Oaep, RsaPrivateKey};
@@ -1230,7 +1229,7 @@ pub async fn session_terminate(
 /// Process NanoTDF header and rewrap DEK
 fn process_nanotdf_header(
     header_base64: &str,
-    kas_private_key: &SecretKey,
+    kas_private_key: &SecureEcPrivateKey,
     session_shared_secret: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Decode base64 header
@@ -1253,7 +1252,7 @@ fn process_nanotdf_header(
     let tdf_ephemeral_public_key = P256PublicKey::from_sec1_bytes(tdf_ephemeral_key_bytes)?;
 
     // Perform ECDH between KAS private key and TDF ephemeral public key
-    let dek_shared_secret = custom_ecdh(kas_private_key, &tdf_ephemeral_public_key)?;
+    let dek_shared_secret = kas_private_key.perform_ecdh(&tdf_ephemeral_public_key)?;
 
     // Detect NanoTDF version and compute salt
     let dek_salt = if let Some(version) = detect_nanotdf_version(&header_bytes) {
@@ -1636,6 +1635,7 @@ B7AXPJ8XPJL5YXPJ8X5cGK8XvB7AQKBgQDpAXPJ8XPJL5YXPJ8X5cGK8XvB7AXPJ
 mod route_tests {
     use super::*;
     use crate::modules::cwt_token::{test_support, CwtValidator};
+    use p256::SecretKey;
     use tokio::net::TcpListener;
 
     const CERT_BYTES: &[u8] = b"fairplay-application-certificate";
@@ -1646,7 +1646,8 @@ mod route_tests {
         let redis = Arc::new(redis::Client::open("redis://127.0.0.1:6379/").unwrap());
         Arc::new(MediaApiState {
             rewrap_state: Arc::new(RewrapState {
-                kas_ec_private_key: sk,
+                kas_ec_private_key: SecureEcPrivateKey::from_bytes(sk.to_bytes().as_slice())
+                    .unwrap(),
                 kas_ec_public_key_pem: pem,
                 kas_rsa_private_key: None,
                 kas_rsa_public_key_pem: None,

@@ -1,5 +1,6 @@
 use crate::modules::crypto;
 use crate::modules::cwt_auth::{require_cwt, AuthenticatedSubject, CwtAuthState};
+use crate::modules::secure_keys::SecureEcPrivateKey;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -13,10 +14,9 @@ use log::{error, info, warn};
 use nanotdf::chain::{ChainValidationRequest, SessionValidator, ValidationError};
 use nanotdf::BinaryParser;
 use opentdf_kas::{
-    compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, rewrap_dek_simple,
-    NanoTdfVersion,
+    compute_nanotdf_salt, detect_nanotdf_version, rewrap_dek, rewrap_dek_simple, NanoTdfVersion,
 };
-use p256::{ecdh::EphemeralSecret, PublicKey as P256PublicKey, SecretKey};
+use p256::{ecdh::EphemeralSecret, PublicKey as P256PublicKey};
 use rand_core::OsRng;
 use rsa::{Oaep, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 /// Server state shared with rewrap endpoint
 pub struct RewrapState {
-    pub kas_ec_private_key: SecretKey,
+    pub kas_ec_private_key: SecureEcPrivateKey,
     pub kas_ec_public_key_pem: String,
     pub kas_rsa_private_key: Option<RsaPrivateKey>,
     pub kas_rsa_public_key_pem: Option<String>,
@@ -503,7 +503,7 @@ fn process_key_access_object(
 /// Process EC (NanoTDF) unwrap
 fn process_ec_unwrap(
     kao_wrapper: &KeyAccessObjectWrapper,
-    kas_private_key: &SecretKey,
+    kas_private_key: &SecureEcPrivateKey,
     session_shared_secret: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Decode base64 header
@@ -526,7 +526,7 @@ fn process_ec_unwrap(
     let tdf_ephemeral_public_key = P256PublicKey::from_sec1_bytes(tdf_ephemeral_key_bytes)?;
 
     // Perform ECDH between KAS private key and TDF ephemeral public key
-    let dek_shared_secret = custom_ecdh(kas_private_key, &tdf_ephemeral_public_key)?;
+    let dek_shared_secret = kas_private_key.perform_ecdh(&tdf_ephemeral_public_key)?;
 
     // Detect NanoTDF version and compute appropriate DEK salt
     let dek_salt = if let Some(version) = detect_nanotdf_version(&header_bytes) {
@@ -738,6 +738,7 @@ mod integration_tests {
     use crate::modules::cwt_token::{test_support, CwtValidator};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use p256::SecretKey;
     use tokio::net::TcpListener;
 
     async fn keys_server() -> (test_support::Signer, wiremock::MockServer) {
@@ -757,7 +758,7 @@ mod integration_tests {
         let sk = SecretKey::random(&mut OsRng);
         let pem = public_key_to_pem(&sk.public_key()).unwrap();
         Arc::new(RewrapState {
-            kas_ec_private_key: sk,
+            kas_ec_private_key: SecureEcPrivateKey::from_bytes(sk.to_bytes().as_slice()).unwrap(),
             kas_ec_public_key_pem: pem,
             kas_rsa_private_key: None,
             kas_rsa_public_key_pem: None,

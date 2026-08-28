@@ -3,10 +3,12 @@
 //! This module provides wrappers around cryptographic keys that ensure
 //! sensitive key material is automatically zeroized on drop.
 //!
-//! Note: These types are prepared for future use in WebSocket handler
-//! chain validation but not yet integrated.
-
-#![allow(dead_code)]
+//! `SecureEcPrivateKey` holds the KAS EC private key for the whole process:
+//! `KasKeys`, `RewrapState` and the RTMP server/session all store this type
+//! rather than raw bytes, so the secret is never copied into a plain
+//! `Vec<u8>`/`[u8; 32]` that outlives a single call.
+//!
+//! Note: `SecureRsaPrivateKey` is prepared for future use and not yet wired in.
 
 use elliptic_curve::sec1::ToEncodedPoint;
 use p256::SecretKey;
@@ -140,11 +142,13 @@ impl Clone for SecureEcPrivateKey {
 /// Secure wrapper for RSA private key.
 ///
 /// The key material is automatically zeroized when dropped.
+#[allow(dead_code)]
 pub struct SecureRsaPrivateKey {
     /// The RSA private key (boxed for size).
     inner: Box<rsa::RsaPrivateKey>,
 }
 
+#[allow(dead_code)]
 impl SecureRsaPrivateKey {
     /// Create from PKCS#8 PEM.
     pub fn from_pkcs8_pem(pem_content: &str) -> Result<Self, KeyError> {
@@ -209,6 +213,17 @@ mod tests {
         let bytes = [0x42u8; 16]; // Too short
         let result = SecureEcPrivateKey::from_bytes(&bytes);
         assert!(matches!(result, Err(KeyError::InvalidKeySize { .. })));
+    }
+
+    #[test]
+    fn ecdh_matches_opentdf_kas_custom_ecdh() {
+        let sk = SecureEcPrivateKey::from_bytes(&[3u8; 32]).unwrap();
+        let peer = p256::SecretKey::from_bytes(&[5u8; 32].into())
+            .unwrap()
+            .public_key();
+        let ours = sk.perform_ecdh(&peer).unwrap();
+        let theirs = opentdf_kas::custom_ecdh(&sk.as_secret_key().unwrap(), &peer).unwrap();
+        assert_eq!(ours.to_vec(), theirs);
     }
 
     #[test]

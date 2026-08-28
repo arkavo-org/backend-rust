@@ -10,12 +10,11 @@ mod modules;
 
 #[cfg(feature = "c2pa_signing")]
 use modules::c2pa_signing;
+use modules::secure_keys::SecureEcPrivateKey;
 use modules::{
     authzen, cbor_protocol, cwt_auth, cwt_token, http_rewrap, media_api, platform_proxy,
 };
-use opentdf_kas::{
-    compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
-};
+use opentdf_kas::{compute_nanotdf_salt, detect_nanotdf_version, rewrap_dek, NanoTdfVersion};
 
 use crate::contracts::content_rating::content_rating::{
     AgeLevel, ContentRating, Rating, RatingLevel,
@@ -39,7 +38,7 @@ use log::{error, info, warn};
 use nanotdf::{BinaryParser, PolicyType, ProtocolEnum, ResourceLocator};
 use once_cell::sync::OnceCell;
 use p256::ecdh::EphemeralSecret;
-use p256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
+use p256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey};
 use rand_core::{OsRng, RngCore};
 use redis::AsyncCommands;
 use redis::Client as RedisClient;
@@ -221,9 +220,13 @@ impl ErrorResponse {
     }
 }
 
+#[derive(Debug)]
 struct KasKeys {
+    /// Compressed SEC1 public key (33 bytes) as served on the WebSocket
+    /// `KasPublicKey` message.
     public_key: Vec<u8>,
-    private_key: Vec<u8>,
+    /// The EC secret, held in a zeroizing wrapper with a redacting `Debug`.
+    private_key: SecureEcPrivateKey,
 }
 
 static KAS_KEYS: OnceCell<Arc<KasKeys>> = OnceCell::new();
@@ -459,13 +462,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_kas_keys(&settings.kas_key_path)?;
 
     // Get KAS keys for HTTP rewrap endpoint
-    let kas_private_key_bytes = get_kas_private_key_bytes().expect("KAS keys not initialized");
-    let kas_private_key_array: [u8; 32] = kas_private_key_bytes
-        .try_into()
-        .expect("Invalid KAS private key size");
-    let kas_private_key =
-        SecretKey::from_bytes(&kas_private_key_array.into()).expect("Invalid KAS private key");
-    let kas_public_key = kas_private_key.public_key();
+    let kas_private_key = get_kas_private_key().expect("KAS keys not initialized");
+    let kas_public_key = kas_private_key
+        .as_secret_key()
+        .expect("Invalid KAS private key")
+        .public_key();
     let kas_public_key_pem = modules::crypto::public_key_to_pem(&kas_public_key)
         .expect("Failed to encode KAS public key");
 
@@ -525,7 +526,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create HTTP rewrap state with chain validator
     let rewrap_state = Arc::new(http_rewrap::RewrapState {
-        kas_ec_private_key: kas_private_key,
+        kas_ec_private_key: kas_private_key.clone(),
         kas_ec_public_key_pem: kas_public_key_pem,
         kas_rsa_private_key,
         kas_rsa_public_key_pem,
@@ -924,7 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(rtmp_port_str) = env::var("RTMP_PORT") {
         let rtmp_port: u16 = rtmp_port_str.parse().unwrap_or(1935);
         let rtmp_redis_client = Arc::new(server_state.redis_client.clone());
-        let rtmp_kas_key = kas_private_key_array;
+        let rtmp_kas_key = kas_private_key.clone();
 
         // Get NATS client for stream event broadcasting
         let rtmp_nats_client = nats_connection.get_client().await;
@@ -1637,18 +1638,11 @@ async fn handle_rewrap(
         }
     };
     // KAS key
-    let kas_private_key_bytes = get_kas_private_key_bytes().unwrap();
-    let kas_private_key_array: [u8; 32] = match kas_private_key_bytes.try_into() {
-        Ok(key) => key,
-        Err(_) => return None,
-    };
-    let kas_private_key = SecretKey::from_bytes(&kas_private_key_array.into())
-        .map_err(|_| "Invalid private key")
-        .ok()?;
+    let kas_private_key = get_kas_private_key()?;
 
     // Perform custom ECDH
     let ecdh_start = Instant::now();
-    let dek_shared_secret_bytes = match custom_ecdh(&kas_private_key, &tdf_ephemeral_public_key) {
+    let dek_shared_secret_bytes = match kas_private_key.perform_ecdh(&tdf_ephemeral_public_key) {
         Ok(secret) => secret,
         Err(e) => {
             info!("Error performing ECDH: {:?}", e);
@@ -1948,8 +1942,8 @@ async fn handle_chain_rewrap(
     };
 
     // 4. Perform ECDH and rewrap
-    let kas_private_key_bytes = match get_kas_private_key_bytes() {
-        Some(bytes) => bytes,
+    let kas_private_key = match get_kas_private_key() {
+        Some(key) => key,
         None => {
             error!("KAS private key not available");
             return Some(cbor_error_response(
@@ -1959,29 +1953,7 @@ async fn handle_chain_rewrap(
         }
     };
 
-    let kas_private_key_array: [u8; 32] = match kas_private_key_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            error!("Invalid KAS private key size");
-            return Some(cbor_error_response(
-                "internal_error",
-                "Invalid KAS private key",
-            ));
-        }
-    };
-
-    let kas_private_key = match SecretKey::from_bytes(&kas_private_key_array.into()) {
-        Ok(key) => key,
-        Err(_) => {
-            error!("Failed to create KAS secret key");
-            return Some(cbor_error_response(
-                "internal_error",
-                "Invalid KAS private key",
-            ));
-        }
-    };
-
-    let dek_shared_secret_bytes = match custom_ecdh(&kas_private_key, &tdf_ephemeral_public_key) {
+    let dek_shared_secret_bytes = match kas_private_key.perform_ecdh(&tdf_ephemeral_public_key) {
         Ok(secret) => secret,
         Err(e) => {
             error!("ECDH failed: {:?}", e);
@@ -2543,18 +2515,12 @@ async fn handle_event(
 }
 
 fn init_kas_keys(key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let pem_content = std::fs::read_to_string(key_path)?;
-    let ec_pem_contents = pem_content.as_bytes();
-    let pem = pem::parse(ec_pem_contents)?;
-    if pem.tag() != "EC PRIVATE KEY" {
-        return Err("Not an EC private key".into());
-    }
-    let kas_private_key = SecretKey::from_sec1_der(pem.contents())?;
-    // Derive the public key from the private key
-    let kas_public_key = kas_private_key.public_key();
-    // Get the compressed representation of the public key
-    let kas_public_key_compressed = kas_public_key.to_encoded_point(true);
-    let kas_public_key_bytes = kas_public_key_compressed.as_bytes().to_vec();
+    // The PEM text is itself secret material: keep it in a zeroizing buffer so
+    // it does not linger on the heap after the key is parsed.
+    let ec_pem_contents = zeroize::Zeroizing::new(std::fs::read_to_string(key_path)?);
+    let kas_private_key = SecureEcPrivateKey::from_sec1_pem(&ec_pem_contents)?;
+    // Compressed SEC1 representation of the derived public key.
+    let kas_public_key_bytes = kas_private_key.public_key()?;
     // Ensure the public key is 33 bytes
     assert_eq!(
         kas_public_key_bytes.len(),
@@ -2563,7 +2529,7 @@ fn init_kas_keys(key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
     let kas_keys = KasKeys {
         public_key: kas_public_key_bytes,
-        private_key: kas_private_key.to_bytes().to_vec(),
+        private_key: kas_private_key,
     };
     KAS_KEYS
         .set(Arc::new(kas_keys))
@@ -2593,7 +2559,9 @@ fn get_kas_public_key() -> Option<Vec<u8>> {
     KAS_KEYS.get().map(|keys| keys.public_key.clone())
 }
 
-fn get_kas_private_key_bytes() -> Option<Vec<u8>> {
+/// Clone of the KAS EC secret. The clone is a deep copy inside the zeroizing
+/// wrapper - the raw bytes are never handed out.
+fn get_kas_private_key() -> Option<SecureEcPrivateKey> {
     KAS_KEYS.get().map(|keys| keys.private_key.clone())
 }
 
@@ -2850,11 +2818,35 @@ fn convert_rating_level(level: arkavo::RatingLevel) -> RatingLevel {
 mod tests {
     use std::error::Error;
 
+    use opentdf_kas::custom_ecdh;
+    use p256::SecretKey;
+
     use elliptic_curve::ScalarPrimitive;
     use elliptic_curve::{CurveArithmetic, NonZeroScalar};
     use p256::NistP256;
 
     use super::*;
+
+    /// The KAS EC secret must never reach a log line: `KasKeys` derives
+    /// `Debug`, so the redaction has to come from `SecureEcPrivateKey` itself.
+    #[test]
+    fn kas_keys_debug_is_redacted() {
+        let secret = [0x42u8; 32];
+        let keys = KasKeys {
+            public_key: vec![0x02, 0x03, 0x04],
+            private_key: SecureEcPrivateKey::from_bytes(&secret).unwrap(),
+        };
+
+        let debug = format!("{:?}", keys);
+        assert!(debug.contains("REDACTED"), "not redacted: {debug}");
+        // 0x42 renders as `66` in a `Vec<u8>` Debug; a leaked secret would show
+        // 32 of them in a row.
+        assert!(!debug.contains("66, 66, 66, 66"), "secret leaked: {debug}");
+        assert!(
+            !debug.contains(&hex::encode(secret)),
+            "secret leaked: {debug}"
+        );
+    }
 
     #[tokio::test]
     async fn test_ephemeral_key_pair_and_custom_ecdh() {
@@ -2898,12 +2890,12 @@ mod tests {
     #[test]
     fn test_ecdh_known_values() -> Result<(), Box<dyn Error>> {
         // These are example values and should be replaced with actual test vectors
-        // kas_private_key_bytes
+        // KAS private key
         let server_private = "472c179ab235274ecb6678bcc5aa0a8578fc59b7431dd8dd37adbeb60c637618";
         let server_public = "03689f8463a91340e347847414f5ef67a6013ab7236b2229c70b717974ee74eb6c";
         // tdf_ephemeral_key
         let client_public = "02c8eee0d2c24780cbc29169739acc68904bdee3c0553d5ec1183ba476942de686";
-        // kas_private_key_bytes
+        // KAS private key
         let private_key_bytes = hex::decode(server_private).unwrap();
         // tdf_ephemeral_public_key
         let public_key_bytes = hex::decode(client_public).unwrap();
@@ -2913,27 +2905,13 @@ mod tests {
             "d5da0342ae4458cece9b3eb2d253c6212e9612ab9f8c9a4249ee4c9c59ccda13";
 
         let client_public_key = PublicKey::from_sec1_bytes(&public_key_bytes).unwrap();
-        let kas_private_key_option: Option<[u8; 32]> = private_key_bytes.clone().try_into().ok();
-        let kas_private_key_array = match kas_private_key_option {
-            Some(array) => array,
-            None => {
-                return Err(Box::new(std::io::Error::other(
-                    "Could not convert to array.",
-                )))
-            }
-        };
-        let server_secret_key = SecretKey::from_bytes(&kas_private_key_array.into())
-            .map_err(|_| "Invalid private key")
-            .ok();
-        let server_secret_key = server_secret_key.unwrap();
+        let server_key = SecureEcPrivateKey::from_bytes(&private_key_bytes)?;
 
-        let server_public_key = server_secret_key.public_key();
-        let compressed_public_key = server_public_key.to_encoded_point(true);
-        let compressed_public_key_bytes = compressed_public_key.as_bytes();
-        // println!("KAS Public Key Hex: {}", hex::encode(compressed_public_key_bytes));
-        assert_eq!(hex::encode(compressed_public_key_bytes), server_public);
+        // `SecureEcPrivateKey::public_key()` is the compressed SEC1 form the
+        // WebSocket `KasPublicKey` message has always advertised.
+        assert_eq!(hex::encode(server_key.public_key()?), server_public);
 
-        let result = custom_ecdh(&server_secret_key, &client_public_key).unwrap();
+        let result = server_key.perform_ecdh(&client_public_key)?;
         assert_eq!(hex::encode(result), expected_shared_secret);
         Ok(())
     }
