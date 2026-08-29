@@ -17,9 +17,7 @@ This implementation uses a **custom binary protocol over WebSocket** rather than
 ```
 Client                                  Server
   |                                       |
-  |-------- WebSocket Connect ---------->|
-  |                                       |
-  |-------- JWT Token (Text) ----------->|  (Optional, for authentication)
+  |-------- WebSocket Connect ---------->|  (Authorization: Bearer <CWT>)
   |                                       |
   |-------- PublicKey (0x01) ----------->|  (ECDH key agreement)
   |<------- PublicKey (0x01) -------------|  (with salt)
@@ -55,24 +53,119 @@ All binary messages use a single-byte type prefix:
 | 0x06 | Event | Bidirectional | FlatBuffers event |
 | 0xFF | Error | Server → Client | JSON error response |
 
-## Authentication
+## Request authentication
 
-### JWT Token (Text Message)
+Authentication is CWT-only across this server — every non-public route, whether it
+speaks the binary WebSocket protocol or plain HTTP, requires a bearer CWT. There is
+no legacy JWT/OAuth fallback and no way to disable the check.
 
-Before any binary operations, clients should send a text message containing a JWT token:
+### CWT Bearer Token
 
-```json
-{
-  "sub": "user_public_id",
-  "age": "Verified 18+"
-}
+Every request to a non-public route must carry an `Authorization` header with a
+base64url-encoded COSE_Sign1 CWT:
+
+```http
+Authorization: Bearer <base64url-cose-sign1-cwt>
 ```
 
-**Configuration:**
-- `JWT_VALIDATION_DISABLED=true` (default): Accepts any JWT without verification
-- `JWT_VALIDATION_DISABLED=false`: Validates signature using public key from `JWT_PUBLIC_KEY_PATH`
+This applies to the `/ws` WebSocket upgrade and to the HTTP routes below alike. The
+CWT is verified against a COSE key fetched from `CWT_KEYS_URL`, and must carry the
+expected `iss` and `aud` claims.
 
-**Supported Algorithms:** RS256, RS384, RS512, ES256, ES384
+**Configuration:**
+- `CWT_KEYS_URL`: COSE key set endpoint for signature verification
+- `CWT_EXPECTED_ISSUER`: required `iss` claim
+- `CWT_EXPECTED_AUDIENCE`: required `aud` claim
+
+**Supported Algorithm:** ES256 over P-256 COSE keys
+
+### Public routes
+
+Exactly three routes are reachable without a bearer CWT, because clients need them
+before they can present one (fetching a key, fetching a certificate) or because
+they carry no secret (a static site-association document):
+
+- `GET /.well-known/apple-app-site-association`
+- `GET /kas/v2/kas_public_key`
+- `GET /media/v1/certificate`
+
+Every other route enforces the bearer CWT requirement above — including
+`/ws`, `POST /kas/v2/rewrap`, the remaining `/media/v1/*` routes, and (when the
+server is built with `--features c2pa_signing`) both `POST /c2pa/v1/sign` and
+`POST /c2pa/v1/validate`. `/c2pa/v1/sign` in particular signs whatever hash the
+caller supplies with the server's C2PA key, so leaving it ungated would make it an
+unauthenticated signing oracle.
+
+The list above is the surface gated by the shared `require_cwt` middleware —
+`/ws` included: the WebSocket upgrade runs the same middleware as the HTTP
+routes, so the `X-Actor-Token` rule below applies to the NanoTDF KAS path too.
+Two optional, off-by-default features add routes outside that middleware:
+
+- **Pass-through proxying** (`KAS_PROXY_MODE=rest|connect|both`, `AUTHZ_PROXY=on`):
+  the forwarded routes (`/kas/v2/rewrap` and `/kas/v2/kas_public_key` under `rest`,
+  the `/kas.AccessService/*` ConnectRPC routes, `/authorization.v2.*`, and
+  `/.well-known/opentdf-configuration`/`/attributes`/`/attr/*`) are not gated by
+  arks's local CWT middleware at all — the upstream OpenTDF platform is the trust
+  boundary and performs its own authentication/authorization on the forwarded
+  request. `KAS_PROXY_MODE=rest` in particular *replaces* the locally-gated
+  `/kas/v2/rewrap` handler with an ungated forward.
+- **AuthZEN 1.0 facade** (`AUTHZEN_FACADE=on`): `POST /access/v1/evaluation` and
+  `POST /access/v1/evaluations` require a bearer CWT too, but verify it themselves
+  (see `src/modules/authzen/`) rather than running through the shared `require_cwt`
+  middleware. `GET /.well-known/authzen-configuration` is public discovery,
+  mirroring `/kas/v2/kas_public_key`.
+
+### `X-Actor-Token` (delegation)
+
+A caller forwarding another party's bearer CWT (for example, a relay acting on a
+user's behalf) may additionally present:
+
+```http
+X-Actor-Token: <base64url-cose-sign1-cwt>
+```
+
+If `X-Actor-Token` is present, it MUST itself be a valid CWT, and its `sub` claim
+MUST appear in the bearer token's `act[]` claim. If either check fails — the actor
+token doesn't verify, or its `sub` is not listed in the bearer's `act[]` — the
+request is rejected with 401, even if the bearer token alone would have been
+valid. There is no same-`sub` self-escape: membership in `act[]` is the only thing
+that authorizes an actor.
+
+### Rewrap request-signature JWT is not an authentication token
+
+`POST /kas/v2/rewrap` accepts a `signed_request_token` JWT in the request body per
+the OpenTDF rewrap protocol. (This is distinct from the binary WebSocket Rewrap
+message (0x03) described above, whose payload is a raw NanoTDF object with no JWT
+wrapper.) This JWT is **not** an authentication credential — caller identity is established
+separately by the CWT bearer above. Instead, it is a protocol-level
+proof-of-possession: the JWT's own payload (`requestBody`) embeds the client's
+ephemeral `clientPublicKey`, and the server verifies the JWT's signature against
+*that* embedded key before trusting its contents. This binds the signed request to
+the specific ephemeral key the client is asking the KAS to rewrap toward, so a
+captured `signed_request_token` cannot be replayed with a substituted key.
+
+### Failure responses
+
+For the routes gated by the shared `require_cwt` middleware (`/ws`, rewrap,
+media, c2pa), all authentication failures (missing bearer, invalid CWT, invalid or unauthorized
+`X-Actor-Token`) return `401 Unauthorized` with a plain-text body such as
+`Missing Bearer CWT`, `Invalid CWT`, or `Actor not authorized for this token` —
+not a JSON error envelope.
+
+The AuthZEN facade routes are the exception: since they verify the CWT
+themselves (`authenticate_pep` in `src/modules/authzen/facade.rs`) rather than
+running through `require_cwt`, their failures use a different shape entirely —
+a JSON envelope (`{"error": "<message>"}`, via `err_json`) and a status code
+that depends on *why* authentication failed, not always 401:
+- an invalid or missing credential → `401` with `{"error": "invalid pep credential"}`
+- a credential that verifies but whose client isn't on the configured
+  allowlist → `403` with `{"error": "pep client not allowlisted"}`
+- the facade's own key set being unavailable → `500` with
+  `{"error": "key set unavailable"}`
+
+An integrator writing an AuthZEN client against this document should expect
+the JSON-envelope/variable-status shape on `/access/v1/evaluation(s)`, not the
+plain-text-401 shape used everywhere else.
 
 ## ECDH Key Agreement (0x01)
 
@@ -198,7 +291,7 @@ Enforces age-based content restrictions using FlatBuffers rating metadata.
 
 #### 3. Simple ABAC (5Cqk3ERPToSMuY8UoKJtcmo4fs1iVyQpq6ndzWzpzWezAF1W)
 
-Attribute-based access using JWT claims subject.
+Attribute-based access using the CWT-derived connection subject (`Claims.sub`, set from the bearer's `sub` claim — see "Request authentication").
 
 ## NATS Integration (0x05)
 
@@ -212,7 +305,7 @@ Attribute-based access using JWT claims subject.
 
 **Subscriptions:**
 1. Global: `nanotdf.messages` (configurable via `NATS_SUBJECT`)
-2. User-specific: `profile.<publicID>` (after JWT authentication)
+2. User-specific: `profile.<publicID>` (after CWT bearer authentication)
 
 Messages received from NATS are forwarded to WebSocket clients with 0x05 prefix.
 
@@ -332,7 +425,7 @@ HKDF-SHA256(
 |---------|------------------|---------------------|
 | Transport | REST/HTTP | WebSocket |
 | Protocol | JSON | Custom Binary |
-| Authentication | Bearer Token (HTTP header) | JWT (WebSocket text message) |
+| Authentication | Bearer Token (HTTP header) | CWT Bearer token (WebSocket upgrade and HTTP routes alike; see "Request authentication") |
 | Rewrap Endpoint | POST /kas/v2/rewrap | Binary message type 0x03 |
 | Key Agreement | Per-request or cached | Session-based ECDH |
 | Push Events | Not supported | NATS pub/sub + type 0x05/0x06 |
@@ -341,7 +434,7 @@ HKDF-SHA256(
 
 ## Testing Recommendations
 
-1. **JWT Configuration:** Set `JWT_VALIDATION_DISABLED=true` for initial testing
+1. **CWT Configuration:** Set `CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER`, and `CWT_EXPECTED_AUDIENCE` — required for every non-public route, not only the WebSocket upgrade
 2. **NATS Availability:** Ensure NATS server is running or expect NATS-related errors
 3. **Redis Caching:** Events require Redis for UserEvent/CacheEvent
 4. **Test Vectors:** Use OpenTDF NanoTDF test vectors for rewrap validation
@@ -383,8 +476,10 @@ S→C: [0xFF]{"error_type":"invalid_format","message":"Session not established -
 | TLS_CERT_PATH | ./fullchain.pem | TLS certificate (optional) |
 | TLS_KEY_PATH | ./privkey.pem | TLS private key (optional) |
 | KAS_KEY_PATH | ./recipient_private_key.pem | KAS EC private key (required) |
-| JWT_VALIDATION_DISABLED | true | Disable JWT signature verification |
-| JWT_PUBLIC_KEY_PATH | - | JWT verification public key (if validation enabled) |
+| CWT_KEYS_URL | https://identity.arkavo.net/.well-known/cose-keys | COSE key set URL for CWT signature verification (gates every non-public route, not only `/ws`) |
+| CWT_EXPECTED_ISSUER | https://identity.arkavo.net | Required CWT `iss` claim |
+| CWT_EXPECTED_AUDIENCE | https://100.arkavo.net | Required CWT `aud` claim |
+| ARKS_SERVICE_CWT_PATH | - | **Required whenever a proxy route is mounted** (`KAS_PROXY_MODE` != `off`, or `AUTHZ_PROXY=on`); startup fails with a message naming the variable if it is unset. Path to a file containing this service's own CWT, relayed as `X-Actor-Token` on every forwarded request so the upstream platform can check it against the caller bearer's `act[]`. Read once at startup — an unreadable file or a value that isn't a valid HTTP header value fails startup, not per-request. To run without an actor token, set `KAS_PROXY_MODE=off` and leave `AUTHZ_PROXY` unset. |
 | NATS_URL | nats://localhost:4222 | NATS server URL |
 | NATS_SUBJECT | nanotdf.messages | Default NATS subscription subject |
 | REDIS_URL | redis://localhost:6379 | Redis connection string |

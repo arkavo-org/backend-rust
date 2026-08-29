@@ -10,7 +10,6 @@
 use bytes::Bytes;
 use opentdf_crypto::tdf::{NanoTdfCollection, NanoTdfCollectionDecryptor};
 use p256::pkcs8::EncodePrivateKey;
-use p256::SecretKey;
 use rml_amf0::Amf0Value;
 use rml_rtmp::chunk_io::Packet;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -30,6 +29,7 @@ use super::encryption::{
 use super::manifest::{delete_cached_manifest, get_cached_manifest, NanoTdfManifest};
 use super::registry::StreamRegistry;
 use super::stream_events::StreamEventBroadcaster;
+use crate::modules::secure_keys::SecureEcPrivateKey;
 
 /// RTMP session role
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +97,10 @@ pub struct RtmpSession {
     collection: Option<Arc<NanoTdfCollection>>,
     /// NanoTDF Decryptor for subscriber-side decryption
     decryptor: Option<NanoTdfCollectionDecryptor>,
-    /// KAS private key for DEK derivation (PKCS#8 DER format)
-    kas_private_key: Vec<u8>,
+    /// KAS private key for DEK derivation. Held in the zeroizing wrapper; the
+    /// PKCS#8 DER encoding opentdf-rs wants is materialized per decryptor and
+    /// dropped immediately.
+    kas_private_key: SecureEcPrivateKey,
     /// Redis client for manifest caching
     redis_client: Arc<redis::Client>,
     /// Stream registry for publisher-subscriber linking
@@ -153,25 +155,15 @@ impl RtmpSession {
     ///
     /// # Arguments
     /// * `redis_client` - Redis client for manifest caching
-    /// * `kas_private_key` - KAS EC private key raw bytes (32 bytes for P-256)
+    /// * `kas_private_key` - KAS EC private key
     /// * `event_broadcaster` - Optional stream event broadcaster for NATS notifications
     /// * `stream_registry` - Shared stream registry for publisher-subscriber linking
     pub fn new(
         redis_client: Arc<redis::Client>,
-        kas_private_key: [u8; 32],
+        kas_private_key: SecureEcPrivateKey,
         event_broadcaster: Option<Arc<StreamEventBroadcaster>>,
         stream_registry: Arc<StreamRegistry>,
     ) -> Self {
-        // Convert raw 32-byte key to PKCS#8 DER format for opentdf-rs
-        // The EcdhKem::derive_key_with_private accepts SEC1 DER or PKCS#8 DER
-        let secret_key =
-            SecretKey::from_bytes(&kas_private_key.into()).expect("Invalid KAS private key bytes");
-        let kas_private_key_der = secret_key
-            .to_pkcs8_der()
-            .expect("Failed to encode key as PKCS#8")
-            .as_bytes()
-            .to_vec();
-
         RtmpSession {
             role: SessionRole::Unknown,
             encryption_mode: EncryptionMode::Pending,
@@ -179,7 +171,7 @@ impl RtmpSession {
             manifest: None,
             collection: None,
             decryptor: None,
-            kas_private_key: kas_private_key_der,
+            kas_private_key,
             redis_client,
             stream_registry,
             frame_sender: None,
@@ -1044,9 +1036,21 @@ impl RtmpSession {
 
     /// Set manifest for subscriber and create decryptor
     fn set_manifest_subscriber(&mut self, manifest: NanoTdfManifest) -> Result<(), SessionError> {
-        // Create decryptor from manifest header bytes and KAS private key
-        let decryptor = create_decryptor_kas(&manifest.header_bytes, &self.kas_private_key)
+        // opentdf-rs derives the DEK itself and wants the key as PKCS#8 DER
+        // (`EcdhKem::derive_key_with_private` accepts SEC1 DER or PKCS#8 DER),
+        // so the encoding is produced here and dropped at the end of this call.
+        // `SecretDocument` zeroizes on drop - the DER never becomes a `Vec`.
+        let kas_private_key_der = self
+            .kas_private_key
+            .as_secret_key()
+            .map_err(|e| SessionError::EncryptionError(e.to_string()))?
+            .to_pkcs8_der()
             .map_err(|e| SessionError::EncryptionError(e.to_string()))?;
+
+        // Create decryptor from manifest header bytes and KAS private key
+        let decryptor =
+            create_decryptor_kas(&manifest.header_bytes, kas_private_key_der.as_bytes())
+                .map_err(|e| SessionError::EncryptionError(e.to_string()))?;
 
         self.manifest = Some(manifest);
         self.decryptor = Some(decryptor);

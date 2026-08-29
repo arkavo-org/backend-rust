@@ -18,6 +18,7 @@ modern ZTDF rewrap (handled by platform).
 | `AUTHZEN_PUBLIC_URL` | unset | `policy_decision_point` identifier. **Set this in production.** If unset it falls back to the request `Host`; `X-Forwarded-Host`/`-Proto` are deliberately *not* trusted (no trusted-proxy config exists here, so honouring them would let a caller point every PEP that bootstraps from the discovery document at a PDP of their choosing). |
 | `AUTHZEN_EXPECTED_AUD` | unset | If set, a PEP service CWT's `aud` must contain this value in addition to its own client id. Without it, a service CWT minted for any other relying party of the same issuer authenticates here. |
 | `AUTHZEN_UPSTREAM_BEARER` | unset | Optional static bearer for facade→OpenTDF (tests / JWT exchange). Default: forward the verified PEP **service CWT**. |
+| `ARKS_SERVICE_CWT_PATH` | — | **Required whenever a proxy route is mounted** (`KAS_PROXY_MODE` ≠ `off`, or `AUTHZ_PROXY=on`). File containing this service's own CWT, relayed as `X-Actor-Token` on every forwarded request. Startup fails, naming the variable, if it is unset. See [Actor-token relay](#actor-token-relay-x-actor-token). |
 
 ## Modes
 
@@ -29,6 +30,54 @@ modern ZTDF rewrap (handled by platform).
 Whenever the mode is anything other than `off`, `/.well-known/opentdf-configuration` is also forwarded to the upstream platform so clients see the authoritative discovery document, along with public attribute discovery (`GET /attributes`, `GET /attr/*`) served from the platform's policy snapshot — attribute FQNs dereference through this host when the namespace DNS (e.g. patreon.arkavo.com) points here.
 
 `/ws` (custom NanoTDF binary protocol) always stays local; `/media/v1/*` and `/c2pa/v1/*` are always local.
+
+## Actor-token relay (`X-Actor-Token`)
+
+When arks forwards a request to the platform, two tokens are involved and the
+direction matters:
+
+| Header | Whose token | What it proves |
+|--------|-------------|----------------|
+| `Authorization: Bearer` | **the caller's**, forwarded byte-for-byte | who the request is *for* — the user or agent that originally authenticated |
+| `X-Actor-Token` | **arks' own** service CWT, from `ARKS_SERVICE_CWT_PATH` | who *forwarded* it — arks identifying itself as the delegate |
+
+That is the direction the identity-plane design (§1) prescribes. The bearer is
+never swapped for an arks-minted token: doing so would erase the caller and turn
+every proxied request into an arks-attributed one. Instead the platform verifies
+the caller's bearer as usual and additionally checks that the actor token's `sub`
+appears in that bearer's `act[]` claim — so only a forwarder the token was
+actually delegated to can relay it.
+
+Any `X-Actor-Token` supplied by the client is **stripped** before arks inserts
+its own. The actor is *this* service and only this service may assert it.
+
+`ARKS_SERVICE_CWT_PATH` is **required** whenever any proxy route is mounted
+(`KAS_PROXY_MODE` ≠ `off`, or `AUTHZ_PROXY=on`); arks fails at startup with an
+error naming the variable if it is unset, the same way a missing
+`OPENTDF_PLATFORM_URL` does. Relaying a bearer with no actor token would leave
+the platform seeing a bare bearer, treating it as direct presentation, and
+skipping the `act[]` check entirely — the delegation rule bypassed by omission on
+every relayed request. An operator who wants no actor token turns proxying off:
+`KAS_PROXY_MODE=off` with `AUTHZ_PROXY` unset.
+
+### Service CWT lifetime (operator note)
+
+**The file is read once, at startup, and never re-read while the process runs.**
+There is no timer, no SIGHUP reload and no refresh endpoint. The lifetime of the
+CWT in that file therefore governs how long relaying works — agent tokens in this
+identity plane are capped at 15 minutes, so a short-lived token will expire well
+inside a normal server uptime.
+
+**Symptom of expiry:** every proxied request starts failing with a `401` produced
+by the **platform**, not by arks. arks logs nothing to explain it — it forwarded
+the request successfully and simply relayed the upstream's response — so the only
+signal is a sudden, total failure of proxied routes while local routes (`/ws`,
+`/media/v1/*`) keep working.
+
+**Remedy:** write a fresh service CWT to `ARKS_SERVICE_CWT_PATH` and restart arks.
+Provision the token with a lifetime comfortably longer than your deployment
+interval, or restart arks whenever you rotate it. Automatic refresh is tracked as
+a follow-up.
 
 ## KAS URL identity caveat
 
@@ -119,4 +168,6 @@ attribute values regardless.
 - No JWT re-signing — clients must present credentials platform accepts.
 - No request-body rewriting (e.g. `kas_url` rewrite).
 - No request streaming — bodies are buffered up to 16 MiB before forwarding.
+- No service-CWT refresh — `ARKS_SERVICE_CWT_PATH` is read once at startup; a
+  fresh token needs a restart (see [Service CWT lifetime](#service-cwt-lifetime-operator-note)).
 - AuthZEN Resource Search (`GetEntitlements`) — phase 6.

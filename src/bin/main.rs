@@ -10,10 +10,11 @@ mod modules;
 
 #[cfg(feature = "c2pa_signing")]
 use modules::c2pa_signing;
-use modules::{authzen, cbor_protocol, http_rewrap, media_api, ntdf_token, platform_proxy};
-use opentdf_kas::{
-    compute_nanotdf_salt, custom_ecdh, detect_nanotdf_version, rewrap_dek, NanoTdfVersion,
+use modules::secure_keys::SecureEcPrivateKey;
+use modules::{
+    authzen, cbor_protocol, cwt_auth, cwt_token, http_rewrap, media_api, platform_proxy,
 };
+use opentdf_kas::{compute_nanotdf_salt, detect_nanotdf_version, rewrap_dek, NanoTdfVersion};
 
 use crate::contracts::content_rating::content_rating::{
     AgeLevel, ContentRating, Rating, RatingLevel,
@@ -27,18 +28,15 @@ use async_nats::Message as NatsMessage;
 use async_nats::{Client as NatsClient, PublishError};
 use aws_sdk_s3 as s3;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, State};
 use axum::response::IntoResponse;
 use flatbuffers::root;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, DecodingKey, Validation};
 use log::{error, info, warn};
 use nanotdf::{BinaryParser, PolicyType, ProtocolEnum, ResourceLocator};
 use once_cell::sync::OnceCell;
 use p256::ecdh::EphemeralSecret;
-use p256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
+use p256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey};
 use rand_core::{OsRng, RngCore};
 use redis::AsyncCommands;
 use redis::Client as RedisClient;
@@ -119,8 +117,6 @@ struct ConnectionState {
     salt_lock: RwLock<Option<Vec<u8>>>,
     shared_secret_lock: RwLock<Option<Vec<u8>>>,
     claims_lock: RwLock<Option<Claims>>,
-    #[allow(dead_code)] // Used for future policy enforcement
-    ntdf_claims_lock: RwLock<Option<ntdf_token::NtdfTokenPayload>>,
     outgoing_tx: mpsc::UnboundedSender<Message>,
 }
 
@@ -130,22 +126,14 @@ impl ConnectionState {
             salt_lock: RwLock::new(None),
             shared_secret_lock: RwLock::new(None),
             claims_lock: RwLock::new(None),
-            ntdf_claims_lock: RwLock::new(None),
             outgoing_tx,
         }
     }
 
-    fn new_with_ntdf_claims(
-        outgoing_tx: mpsc::UnboundedSender<Message>,
-        ntdf_claims: ntdf_token::NtdfTokenPayload,
-    ) -> Self {
-        ConnectionState {
-            salt_lock: RwLock::new(None),
-            shared_secret_lock: RwLock::new(None),
-            claims_lock: RwLock::new(None),
-            ntdf_claims_lock: RwLock::new(Some(ntdf_claims)),
-            outgoing_tx,
-        }
+    fn new_with_claims(outgoing_tx: mpsc::UnboundedSender<Message>, claims: Claims) -> Self {
+        let state = Self::new(outgoing_tx);
+        *state.claims_lock.write().unwrap() = Some(claims);
+        state
     }
 }
 
@@ -230,9 +218,13 @@ impl ErrorResponse {
     }
 }
 
+#[derive(Debug)]
 struct KasKeys {
+    /// Compressed SEC1 public key (33 bytes) as served on the WebSocket
+    /// `KasPublicKey` message.
     public_key: Vec<u8>,
-    private_key: Vec<u8>,
+    /// The EC secret, held in a zeroizing wrapper with a redacting `Debug`.
+    private_key: SecureEcPrivateKey,
 }
 
 static KAS_KEYS: OnceCell<Arc<KasKeys>> = OnceCell::new();
@@ -256,195 +248,81 @@ async fn log_request_middleware(
     response
 }
 
+/// Read this service's own CWT for relaying as `X-Actor-Token`.
+///
+/// `ARKS_SERVICE_CWT_PATH` is **required** whenever any proxy route is
+/// mounted (`KAS_PROXY_MODE` != `off`, or `AUTHZ_PROXY=on`). Spec §1 makes the
+/// forwarder's self-identification a MUST: without an actor token the upstream
+/// platform sees a bare forwarded bearer, treats it as direct presentation,
+/// and the `act[]` delegation check is bypassed by omission on every relayed
+/// request. Failing at startup — like a missing `OPENTDF_PLATFORM_URL` — is
+/// the only way that cannot be missed. An operator who wants no actor token
+/// turns proxying off instead.
+fn load_service_cwt(path: Option<String>) -> Result<String, String> {
+    let Some(path) = path else {
+        return Err(
+            "ARKS_SERVICE_CWT_PATH must be set whenever a proxy route is mounted \
+             (KAS_PROXY_MODE != off, or AUTHZ_PROXY=on): arks must identify itself \
+             to the upstream platform as the forwarder via X-Actor-Token. \
+             To run without an actor token, set KAS_PROXY_MODE=off and leave \
+             AUTHZ_PROXY unset."
+                .to_string(),
+        );
+    };
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("ARKS_SERVICE_CWT_PATH {path} unreadable: {e}"))
+}
+
+/// `/ws` (the NanoTDF KAS upgrade, 0x03 rewrap) behind the shared CWT gate.
+///
+/// `/ws` is a gated route like any other, so it runs the same `require_cwt`
+/// middleware as the rewrap/media/c2pa routers — that is what applies the
+/// spec §1 `act` rule (`X-Actor-Token` must be a valid CWT whose `sub` is in
+/// the bearer's `act[]`) to the primary KAS path.
+///
+/// `route_layer`, not `layer`: the middleware must apply only to `/ws` and
+/// must not wrap this router's fallback, or merging it into the app would
+/// turn every unmatched path into a 401. The public routes
+/// (`/.well-known/apple-app-site-association`, `/kas/v2/kas_public_key`,
+/// `/media/v1/certificate`) live on unlayered routers merged in alongside.
+fn ws_router(state: Arc<WebSocketState>, auth: Arc<cwt_auth::CwtAuthState>) -> axum::Router {
+    axum::Router::new()
+        .route("/ws", axum::routing::get(ws_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            cwt_auth::require_cwt,
+        ))
+        .with_state(state)
+}
+
 /// WebSocket upgrade handler for Axum
 async fn ws_handler(
     State(state): State<Arc<WebSocketState>>,
-    headers: HeaderMap,
+    Extension(subject): Extension<cwt_auth::AuthenticatedSubject>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Check for NTDF token in Authorization header
-    if let Some(auth_header) = headers.get(AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("NTDF ") {
-                // Validate NTDF token
-                match get_kas_private_key_bytes() {
-                    Some(kas_key_bytes) => {
-                        let kas_key_array: [u8; 32] = match kas_key_bytes.try_into() {
-                            Ok(arr) => arr,
-                            Err(_) => {
-                                warn!("Invalid KAS private key length");
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Server configuration error",
-                                )
-                                    .into_response();
-                            }
-                        };
-                        let kas_private_key = match SecretKey::from_bytes(&kas_key_array.into()) {
-                            Ok(key) => key,
-                            Err(_) => {
-                                warn!("Invalid KAS private key");
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Server configuration error",
-                                )
-                                    .into_response();
-                            }
-                        };
+    // The bearer (and any `X-Actor-Token`) was already verified by the
+    // `require_cwt` middleware this route is mounted behind; the verified
+    // identity arrives as an extension. Re-validating here would be a second,
+    // drift-prone copy of the gate.
+    info!(
+        "CWT-authenticated /ws upgrade: sub={}, actor={:?}",
+        subject.sub, subject.actor
+    );
+    let claims = Claims {
+        sub: subject.sub,
+        age: String::new(),
+    };
 
-                        match ntdf_token::validate_ntdf_token(
-                            auth_str,
-                            &kas_private_key,
-                            &state.server_state.settings.ntdf_expected_audience,
-                        ) {
-                            Ok(claims) => {
-                                info!("NTDF token validated: sub_id={}", claims.sub_id_hex());
-                                return ws
-                                    .on_upgrade(move |socket| {
-                                        handle_websocket_axum_with_ntdf(socket, state, claims)
-                                    })
-                                    .into_response();
-                            }
-                            Err(e) => {
-                                warn!("NTDF token validation failed: {:?}", e);
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    format!("Invalid NTDF token: {}", e),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("KAS private key not initialized");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "Server not ready")
-                            .into_response();
-                    }
-                }
-            }
-        }
-    }
-
-    // No NTDF token - allow for backward compatibility
-    ws.on_upgrade(move |socket| handle_websocket_axum(socket, state))
+    ws.on_upgrade(move |socket| handle_websocket_axum(socket, state, Some(claims)))
         .into_response()
 }
 
 /// Handle WebSocket connection using Axum's WebSocket type
-async fn handle_websocket_axum(ws: WebSocket, state: Arc<WebSocketState>) {
-    // Split the WebSocket into sender and receiver
-    let (mut ws_sender, mut ws_receiver) = ws.split();
-
-    // Create channel for outgoing messages
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
-
-    // Create ConnectionState with the outgoing channel
-    let connection_state = Arc::new(ConnectionState::new(outgoing_tx));
-
-    // Set up NATS subscription for this connection
-    let nats_task = tokio::spawn(handle_nats_subscription(
-        state.nats_connection.clone(),
-        state.server_state.settings.nats_subject.clone(),
-        connection_state.clone(),
-    ));
-
-    let mut public_id_nats_task: Option<tokio::task::JoinHandle<()>> = None;
-
-    // Spawn task to forward outgoing messages
-    let outgoing_task = tokio::spawn(async move {
-        while let Some(msg) = outgoing_rx.recv().await {
-            // Convert tokio_tungstenite Message to Axum WebSocket message
-            let axum_msg = match msg {
-                Message::Binary(data) => AxumMessage::Binary(data),
-                Message::Text(text) => AxumMessage::Text(text),
-                Message::Close(_) => AxumMessage::Close(None),
-                _ => continue,
-            };
-
-            if ws_sender.send(axum_msg).await.is_err() {
-                eprintln!("Failed to send outgoing message through WebSocket");
-                break;
-            }
-        }
-    });
-
-    // Handle incoming WebSocket messages
-    while let Some(result) = ws_receiver.next().await {
-        match result {
-            Ok(msg) => {
-                match msg {
-                    AxumMessage::Close(_) => {
-                        println!("Received a close message.");
-                        break;
-                    }
-                    AxumMessage::Text(token) => {
-                        // Handle JWT token
-                        println!("token: {}", token);
-                        match verify_token(&token, &state.server_state.settings) {
-                            Ok(claims) => {
-                                println!("Valid JWT received. Claims: {:?}", claims);
-                                // Store the claims
-                                {
-                                    let mut claims_lock =
-                                        connection_state.claims_lock.write().unwrap();
-                                    *claims_lock = Some(claims.clone());
-                                }
-                                // Extract publicID from claims and subscribe to `profile.<publicID>`
-                                let public_id = claims.sub;
-                                let subject = format!("profile.{}", public_id);
-                                // Cancel any existing `publicID`-specific NATS task
-                                if let Some(task) = public_id_nats_task.take() {
-                                    task.abort();
-                                }
-                                // Set up new NATS subscription for `profile.<publicID>`
-                                public_id_nats_task = Some(tokio::spawn(handle_nats_subscription(
-                                    state.nats_connection.clone(),
-                                    subject,
-                                    connection_state.clone(),
-                                )));
-                            }
-                            Err(e) => {
-                                error!("Invalid JWT: {}", e);
-                            }
-                        }
-                    }
-                    AxumMessage::Binary(data) => {
-                        // Handle binary message
-                        if let Some(response) = handle_binary_message(
-                            &connection_state,
-                            &state.server_state,
-                            data,
-                            state.nats_connection.clone(),
-                        )
-                        .await
-                        {
-                            // Convert tokio_tungstenite Message to Axum message and send via channel
-                            let _ = connection_state.outgoing_tx.send(response);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                eprintln!("Error reading message: {}", e);
-                break;
-            }
-        }
-    }
-
-    // Cancel the NATS subscription when the WebSocket connection closes
-    nats_task.abort();
-    if let Some(task) = public_id_nats_task {
-        task.abort();
-    }
-    outgoing_task.abort();
-}
-
-/// Handle WebSocket connection with pre-validated NTDF claims
-async fn handle_websocket_axum_with_ntdf(
+async fn handle_websocket_axum(
     ws: WebSocket,
     state: Arc<WebSocketState>,
-    ntdf_claims: ntdf_token::NtdfTokenPayload,
+    initial_claims: Option<Claims>,
 ) {
     // Split the WebSocket into sender and receiver
     let (mut ws_sender, mut ws_receiver) = ws.split();
@@ -452,11 +330,11 @@ async fn handle_websocket_axum_with_ntdf(
     // Create channel for outgoing messages
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
 
-    // Create ConnectionState with NTDF claims
-    let connection_state = Arc::new(ConnectionState::new_with_ntdf_claims(
-        outgoing_tx,
-        ntdf_claims.clone(),
-    ));
+    // Create ConnectionState with the outgoing channel
+    let connection_state = Arc::new(match initial_claims.clone() {
+        Some(claims) => ConnectionState::new_with_claims(outgoing_tx, claims),
+        None => ConnectionState::new(outgoing_tx),
+    });
 
     // Set up NATS subscription for this connection
     let nats_task = tokio::spawn(handle_nats_subscription(
@@ -465,14 +343,15 @@ async fn handle_websocket_axum_with_ntdf(
         connection_state.clone(),
     ));
 
-    // Subscribe to user-specific subject based on sub_id from NTDF token
-    let user_subject = format!("profile.{}", ntdf_claims.sub_id_hex());
-    info!("Subscribing to user subject: {}", user_subject);
-    let public_id_nats_task = Some(tokio::spawn(handle_nats_subscription(
-        state.nats_connection.clone(),
-        user_subject,
-        connection_state.clone(),
-    )));
+    let public_id_nats_task: Option<tokio::task::JoinHandle<()>> = initial_claims.map(|claims| {
+        let subject = format!("profile.{}", claims.sub);
+        info!("Subscribing to user subject: {}", subject);
+        tokio::spawn(handle_nats_subscription(
+            state.nats_connection.clone(),
+            subject,
+            connection_state.clone(),
+        ))
+    });
 
     // Spawn task to forward outgoing messages
     let outgoing_task = tokio::spawn(async move {
@@ -501,9 +380,11 @@ async fn handle_websocket_axum_with_ntdf(
                         info!("Received a close message.");
                         break;
                     }
-                    AxumMessage::Text(_text) => {
-                        // JWT tokens not needed - already authenticated via NTDF
-                        // Could be used for other text-based messages in the future
+                    AxumMessage::Text(text) => {
+                        info!(
+                            "Ignoring WebSocket text message after CWT authentication ({} bytes)",
+                            text.len()
+                        );
                     }
                     AxumMessage::Binary(data) => {
                         // Handle binary message
@@ -612,13 +493,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_kas_keys(&settings.kas_key_path)?;
 
     // Get KAS keys for HTTP rewrap endpoint
-    let kas_private_key_bytes = get_kas_private_key_bytes().expect("KAS keys not initialized");
-    let kas_private_key_array: [u8; 32] = kas_private_key_bytes
-        .try_into()
-        .expect("Invalid KAS private key size");
-    let kas_private_key =
-        SecretKey::from_bytes(&kas_private_key_array.into()).expect("Invalid KAS private key");
-    let kas_public_key = kas_private_key.public_key();
+    let kas_private_key = get_kas_private_key().expect("KAS keys not initialized");
+    let kas_public_key = kas_private_key
+        .as_secret_key()
+        .expect("Invalid KAS private key")
+        .public_key();
     let kas_public_key_pem = modules::crypto::public_key_to_pem(&kas_public_key)
         .expect("Failed to encode KAS public key");
 
@@ -657,17 +536,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Load OAuth public key from environment if provided
-    let oauth_public_key_pem = env::var("OAUTH_PUBLIC_KEY_PATH")
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok());
-
-    if oauth_public_key_pem.is_some() {
-        info!("OAuth JWT signature validation enabled");
-    } else {
-        info!("OAuth JWT signature validation disabled (development mode)");
-    }
-
     // Load optional RSA key for Standard TDF support
     let (kas_rsa_private_key, kas_rsa_public_key_pem) =
         if let Ok(rsa_key_path) = env::var("KAS_RSA_KEY_PATH") {
@@ -689,11 +557,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create HTTP rewrap state with chain validator
     let rewrap_state = Arc::new(http_rewrap::RewrapState {
-        kas_ec_private_key: kas_private_key,
+        kas_ec_private_key: kas_private_key.clone(),
         kas_ec_public_key_pem: kas_public_key_pem,
         kas_rsa_private_key,
         kas_rsa_public_key_pem,
-        oauth_public_key_pem,
         chain_validator: chain_validator.clone(),
     });
 
@@ -719,6 +586,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let platform_proxy_state = match (env::var("OPENTDF_PLATFORM_URL").ok(), needs_upstream) {
         (Some(url), true) => {
             let state = platform_proxy::PlatformProxyState::new(&url)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // When arks relays a caller's bearer to the platform it must also
+            // identify itself as the forwarder, so the platform can check the
+            // bearer's `act[]`. Required, not optional — see `load_service_cwt`.
+            let service_cwt_path = env::var("ARKS_SERVICE_CWT_PATH").ok();
+            let token = load_service_cwt(service_cwt_path.clone())
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let Some(path) = &service_cwt_path {
+                info!("Platform proxy will relay X-Actor-Token from {path}");
+            }
+            let state = state
+                .with_actor_token(&token)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             info!(
                 "Platform proxy enabled: mode={:?}, authz_proxy={}, upstream={}",
@@ -857,9 +736,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _c2pa_signing_state: Option<Arc<()>> = None;
 
     use axum::{
-        routing::{delete, get, post},
+        routing::{get, post},
         Router,
     };
+
+    // One CWT validator for the whole process: the /ws handshake, the bearer
+    // middleware on the rewrap/media routers, and any actor-token check all
+    // share its key cache and its issuer/audience expectations. A second
+    // instance would be a second, drift-prone source of truth.
+    let cwt_validator = Arc::new(cwt_token::CwtValidator::new(
+        settings.cwt_keys_url.clone(),
+        settings.cwt_expected_issuer.clone(),
+        settings.cwt_expected_audience.clone(),
+    ));
+    let cwt_auth = Arc::new(cwt_auth::CwtAuthState {
+        validator: cwt_validator.clone(),
+    });
 
     // OpenTDF compatibility router — either local handlers or forwarded
     // to upstream platform, depending on KAS_PROXY_MODE.
@@ -873,13 +765,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/kas/v2/kas_public_key", get(platform_proxy::proxy))
             .with_state(state)
     } else {
-        Router::new()
-            .route("/kas/v2/rewrap", post(http_rewrap::rewrap_handler))
-            .route(
-                "/kas/v2/kas_public_key",
-                get(http_rewrap::kas_public_key_handler),
-            )
-            .with_state(rewrap_state)
+        // Locally served: /kas/v2/rewrap requires a CWT bearer,
+        // /kas/v2/kas_public_key stays public.
+        http_rewrap::local_router(rewrap_state, cwt_auth.clone())
     };
 
     // Platform discovery — `/.well-known/opentdf-configuration` is published by
@@ -957,31 +845,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
-    // Media DRM router
-    let media_router = Router::new()
-        .route("/media/v1/key-request", post(media_api::media_key_request))
-        .route(
-            "/media/v1/certificate",
-            get(media_api::fairplay_certificate),
-        )
-        .route("/media/v1/session/start", post(media_api::session_start))
-        .route(
-            "/media/v1/session/:session_id/heartbeat",
-            post(media_api::session_heartbeat),
-        )
-        .route(
-            "/media/v1/session/:session_id",
-            delete(media_api::session_terminate),
-        )
-        .with_state(media_api_state);
+    // Media DRM router — every route requires a CWT bearer except
+    // /media/v1/certificate (see `media_api::router`).
+    let media_router = media_api::router(media_api_state, cwt_auth.clone());
 
-    // C2PA signing router (optional - only if configured)
+    // C2PA signing router (optional - only if configured).
+    // Both routes require a CWT bearer (see `c2pa_signing::router`).
     #[cfg(feature = "c2pa_signing")]
     let c2pa_router = if let Some(c2pa_state) = c2pa_signing_state {
-        Router::new()
-            .route("/c2pa/v1/sign", post(c2pa_signing::sign_manifest))
-            .route("/c2pa/v1/validate", post(c2pa_signing::validate_manifest))
-            .with_state(c2pa_state)
+        c2pa_signing::router(c2pa_state, cwt_auth.clone())
     } else {
         Router::new() // Empty router if C2PA not configured
     };
@@ -998,12 +870,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Combine all routers
     let app = Router::new()
-        .route("/ws", get(ws_handler))
         .route(
             "/.well-known/apple-app-site-association",
             get(apple_app_site_association_handler),
         )
-        .with_state(ws_state)
+        .with_state(ws_state.clone())
+        .merge(ws_router(ws_state, cwt_auth.clone()))
         .merge(opentdf_router)
         .merge(wellknown_router)
         .merge(connect_router)
@@ -1075,7 +947,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(rtmp_port_str) = env::var("RTMP_PORT") {
         let rtmp_port: u16 = rtmp_port_str.parse().unwrap_or(1935);
         let rtmp_redis_client = Arc::new(server_state.redis_client.clone());
-        let rtmp_kas_key = kas_private_key_array;
+        let rtmp_kas_key = kas_private_key.clone();
 
         // Get NATS client for stream event broadcasting
         let rtmp_nats_client = nats_connection.get_client().await;
@@ -1266,69 +1138,6 @@ fn load_rustls_config(
 struct Claims {
     sub: String,
     age: String,
-}
-
-fn verify_token(
-    token: &str,
-    settings: &ServerSettings,
-) -> Result<Claims, jsonwebtoken::errors::Error> {
-    if settings.jwt_validation_disabled {
-        // Development mode - disable signature validation
-        log::warn!(
-            "⚠️  JWT signature validation is DISABLED - for development only! \
-             Set JWT_VALIDATION_DISABLED=false for production."
-        );
-        let token_data = jsonwebtoken::dangerous::insecure_decode::<Claims>(token)?;
-        Ok(token_data.claims)
-    } else {
-        // Production mode - proper JWT validation
-        let mut validation = Validation::default();
-        validation.validate_exp = true;
-        validation.validate_aud = false; // Can be enabled if audience is specified
-
-        // Load the public key for verification
-        let public_key_path = settings.jwt_public_key_path.as_ref().ok_or_else(|| {
-            jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
-        })?;
-
-        let public_key_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
-            error!(
-                "Failed to read JWT public key from {}: {}",
-                public_key_path, e
-            );
-            jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
-        })?;
-
-        // Support both RSA and ECDSA keys
-        let decoding_key = if public_key_pem.contains("BEGIN RSA PUBLIC KEY")
-            || public_key_pem.contains("BEGIN PUBLIC KEY")
-        {
-            validation.algorithms = vec![
-                jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::Algorithm::RS384,
-                jsonwebtoken::Algorithm::RS512,
-            ];
-            DecodingKey::from_rsa_pem(public_key_pem.as_bytes())?
-        } else if public_key_pem.contains("BEGIN EC PUBLIC KEY") {
-            validation.algorithms = vec![
-                jsonwebtoken::Algorithm::ES256,
-                jsonwebtoken::Algorithm::ES384,
-            ];
-            DecodingKey::from_ec_pem(public_key_pem.as_bytes())?
-        } else {
-            error!("Unsupported JWT public key format");
-            return Err(jsonwebtoken::errors::Error::from(
-                jsonwebtoken::errors::ErrorKind::InvalidKeyFormat,
-            ));
-        };
-
-        let token_data = decode::<Claims>(token, &decoding_key, &validation)?;
-        info!(
-            "JWT signature verified successfully for subject: {}",
-            token_data.claims.sub
-        );
-        Ok(token_data.claims)
-    }
 }
 
 async fn handle_binary_message(
@@ -1672,22 +1481,13 @@ async fn handle_rewrap(
         if locator.protocol_enum == ProtocolEnum::SharedResource {
             info!("Evaluating contract: {}", locator.body.clone());
             if !locator.body.is_empty() {
-                //  "Verified 18+"
+                // Subject of the authenticated CWT, for ABAC contract checks.
                 let claims_result = match connection_state.claims_lock.read() {
                     Ok(read_lock) => match read_lock.clone() {
                         Some(value) => Ok(value.sub),
                         None => Err("Error: Clone cannot be performed"),
                     },
                     Err(_) => Err("Error: Read lock cannot be obtained"),
-                };
-                let verified_age_result = match connection_state
-                    .claims_lock
-                    .read()
-                    .expect("Error: Read lock cannot be obtained")
-                    .clone()
-                {
-                    Some(claims) => Ok(claims.age == "Verified 18+"),
-                    None => Err("Error: Claims data not available"),
                 };
                 // geo_fence_contract
                 if locator
@@ -1791,11 +1591,11 @@ async fn handle_rewrap(
                     let contract = ContentRating::new();
                     // Parse the content rating data from the policy body
                     // get entitlements
-                    let age_level = if verified_age_result.unwrap_or(false) {
-                        AgeLevel::Adults
-                    } else {
-                        AgeLevel::Kids
-                    };
+                    // Fail-closed: CWTs carry no age claim, so age gating always
+                    // resolves to the most restrictive level. Ruled intended
+                    // behaviour post-NTDF-migration; do not re-add an age claim
+                    // here without a verified source for it.
+                    let age_level = AgeLevel::Kids;
                     if metadata.is_none() {
                         println!("metadata is null");
                         return None;
@@ -1860,18 +1660,11 @@ async fn handle_rewrap(
         }
     };
     // KAS key
-    let kas_private_key_bytes = get_kas_private_key_bytes().unwrap();
-    let kas_private_key_array: [u8; 32] = match kas_private_key_bytes.try_into() {
-        Ok(key) => key,
-        Err(_) => return None,
-    };
-    let kas_private_key = SecretKey::from_bytes(&kas_private_key_array.into())
-        .map_err(|_| "Invalid private key")
-        .ok()?;
+    let kas_private_key = get_kas_private_key()?;
 
     // Perform custom ECDH
     let ecdh_start = Instant::now();
-    let dek_shared_secret_bytes = match custom_ecdh(&kas_private_key, &tdf_ephemeral_public_key) {
+    let dek_shared_secret_bytes = match kas_private_key.perform_ecdh(&tdf_ephemeral_public_key) {
         Ok(secret) => secret,
         Err(e) => {
             info!("Error performing ECDH: {:?}", e);
@@ -2171,8 +1964,8 @@ async fn handle_chain_rewrap(
     };
 
     // 4. Perform ECDH and rewrap
-    let kas_private_key_bytes = match get_kas_private_key_bytes() {
-        Some(bytes) => bytes,
+    let kas_private_key = match get_kas_private_key() {
+        Some(key) => key,
         None => {
             error!("KAS private key not available");
             return Some(cbor_error_response(
@@ -2182,29 +1975,7 @@ async fn handle_chain_rewrap(
         }
     };
 
-    let kas_private_key_array: [u8; 32] = match kas_private_key_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            error!("Invalid KAS private key size");
-            return Some(cbor_error_response(
-                "internal_error",
-                "Invalid KAS private key",
-            ));
-        }
-    };
-
-    let kas_private_key = match SecretKey::from_bytes(&kas_private_key_array.into()) {
-        Ok(key) => key,
-        Err(_) => {
-            error!("Failed to create KAS secret key");
-            return Some(cbor_error_response(
-                "internal_error",
-                "Invalid KAS private key",
-            ));
-        }
-    };
-
-    let dek_shared_secret_bytes = match custom_ecdh(&kas_private_key, &tdf_ephemeral_public_key) {
+    let dek_shared_secret_bytes = match kas_private_key.perform_ecdh(&tdf_ephemeral_public_key) {
         Ok(secret) => secret,
         Err(e) => {
             error!("ECDH failed: {:?}", e);
@@ -2766,18 +2537,12 @@ async fn handle_event(
 }
 
 fn init_kas_keys(key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let pem_content = std::fs::read_to_string(key_path)?;
-    let ec_pem_contents = pem_content.as_bytes();
-    let pem = pem::parse(ec_pem_contents)?;
-    if pem.tag() != "EC PRIVATE KEY" {
-        return Err("Not an EC private key".into());
-    }
-    let kas_private_key = SecretKey::from_sec1_der(pem.contents())?;
-    // Derive the public key from the private key
-    let kas_public_key = kas_private_key.public_key();
-    // Get the compressed representation of the public key
-    let kas_public_key_compressed = kas_public_key.to_encoded_point(true);
-    let kas_public_key_bytes = kas_public_key_compressed.as_bytes().to_vec();
+    // The PEM text is itself secret material: keep it in a zeroizing buffer so
+    // it does not linger on the heap after the key is parsed.
+    let ec_pem_contents = zeroize::Zeroizing::new(std::fs::read_to_string(key_path)?);
+    let kas_private_key = SecureEcPrivateKey::from_sec1_pem(&ec_pem_contents)?;
+    // Compressed SEC1 representation of the derived public key.
+    let kas_public_key_bytes = kas_private_key.public_key()?;
     // Ensure the public key is 33 bytes
     assert_eq!(
         kas_public_key_bytes.len(),
@@ -2786,7 +2551,7 @@ fn init_kas_keys(key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
     let kas_keys = KasKeys {
         public_key: kas_public_key_bytes,
-        private_key: kas_private_key.to_bytes().to_vec(),
+        private_key: kas_private_key,
     };
     KAS_KEYS
         .set(Arc::new(kas_keys))
@@ -2816,7 +2581,9 @@ fn get_kas_public_key() -> Option<Vec<u8>> {
     KAS_KEYS.get().map(|keys| keys.public_key.clone())
 }
 
-fn get_kas_private_key_bytes() -> Option<Vec<u8>> {
+/// Clone of the KAS EC secret. The clone is a deep copy inside the zeroizing
+/// wrapper - the raw bytes are never handed out.
+fn get_kas_private_key() -> Option<SecureEcPrivateKey> {
     KAS_KEYS.get().map(|keys| keys.private_key.clone())
 }
 
@@ -2868,13 +2635,12 @@ struct ServerSettings {
     nats_url: String,
     nats_subject: String,
     redis_url: String,
-    jwt_validation_disabled: bool,
-    jwt_public_key_path: Option<String>,
     s3_bucket: String,
     /// Chain RPC URL for blockchain connectivity (optional - disables chain validation if not set)
     chain_rpc_url: Option<String>,
-    /// Expected audience for NTDF token validation
-    ntdf_expected_audience: String,
+    cwt_keys_url: String,
+    cwt_expected_issuer: String,
+    cwt_expected_audience: String,
 }
 
 fn log_timing(settings: &ServerSettings, message: &str, duration: std::time::Duration) {
@@ -2918,15 +2684,14 @@ fn load_config() -> Result<ServerSettings, Box<dyn std::error::Error>> {
         nats_url: env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
         nats_subject: env::var("NATS_SUBJECT").unwrap_or_else(|_| "nanotdf.messages".to_string()),
         redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
-        jwt_validation_disabled: env::var("JWT_VALIDATION_DISABLED")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true),
-        jwt_public_key_path: env::var("JWT_PUBLIC_KEY_PATH").ok(),
         s3_bucket: env::var("S3_BUCKET").unwrap_or_else(|_| "default-bucket".to_string()),
         chain_rpc_url: env::var("CHAIN_RPC_URL").ok(),
-        ntdf_expected_audience: env::var("NTDF_EXPECTED_AUDIENCE")
-            .unwrap_or_else(|_| "https://platform.arkavo.net".to_string()),
+        cwt_keys_url: env::var("CWT_KEYS_URL")
+            .unwrap_or_else(|_| "https://identity.arkavo.net/.well-known/cose-keys".to_string()),
+        cwt_expected_issuer: env::var("CWT_EXPECTED_ISSUER")
+            .unwrap_or_else(|_| "https://identity.arkavo.net".to_string()),
+        cwt_expected_audience: env::var("CWT_EXPECTED_AUDIENCE")
+            .unwrap_or_else(|_| "https://100.arkavo.net".to_string()),
     })
 }
 
@@ -2988,16 +2753,6 @@ fn validate_config(settings: &ServerSettings) -> Result<(), Box<dyn std::error::
         .into());
     }
 
-    // Validate JWT configuration
-    if !settings.jwt_validation_disabled && settings.jwt_public_key_path.is_none() {
-        return Err("JWT_PUBLIC_KEY_PATH must be set when JWT validation is enabled".into());
-    }
-    if let Some(ref jwt_key_path) = settings.jwt_public_key_path {
-        if !std::path::Path::new(jwt_key_path).exists() {
-            return Err(format!("JWT public key file not found: {}", jwt_key_path).into());
-        }
-    }
-
     // Validate S3 bucket name
     if settings.s3_bucket.is_empty() {
         return Err("S3_BUCKET must not be empty".into());
@@ -3016,6 +2771,16 @@ fn validate_config(settings: &ServerSettings) -> Result<(), Box<dyn std::error::
             )
             .into());
         }
+    }
+
+    if settings.cwt_keys_url.is_empty() {
+        return Err("CWT_KEYS_URL must not be empty".into());
+    }
+    if settings.cwt_expected_issuer.is_empty() {
+        return Err("CWT_EXPECTED_ISSUER must not be empty".into());
+    }
+    if settings.cwt_expected_audience.is_empty() {
+        return Err("CWT_EXPECTED_AUDIENCE must not be empty".into());
     }
 
     info!("✓ Configuration validation passed");
@@ -3074,11 +2839,244 @@ fn convert_rating_level(level: arkavo::RatingLevel) -> RatingLevel {
 mod tests {
     use std::error::Error;
 
+    use opentdf_kas::custom_ecdh;
+    use p256::SecretKey;
+
     use elliptic_curve::ScalarPrimitive;
     use elliptic_curve::{CurveArithmetic, NonZeroScalar};
     use p256::NistP256;
 
     use super::*;
+
+    /// Spec §1 makes the forwarder's self-identification a MUST: when arks
+    /// relays a caller's bearer to the platform it must also present its own
+    /// service CWT as `X-Actor-Token`, or the platform sees a bare bearer,
+    /// treats it as direct presentation, and the `act[]` mechanism is bypassed
+    /// by omission. So `ARKS_SERVICE_CWT_PATH` is required whenever any proxy
+    /// route is mounted — an operator who wants no actor token sets
+    /// `KAS_PROXY_MODE=off` and leaves `AUTHZ_PROXY` unset.
+    mod service_cwt {
+        use super::*;
+
+        #[test]
+        fn missing_path_fails_startup_naming_the_variable() {
+            let err = load_service_cwt(None).expect_err("unset path must fail startup");
+            assert!(
+                err.contains("ARKS_SERVICE_CWT_PATH"),
+                "error must name the variable: {err}"
+            );
+            assert!(
+                err.contains("KAS_PROXY_MODE=off"),
+                "error must state the remedy: {err}"
+            );
+        }
+
+        #[test]
+        fn unreadable_path_fails_startup() {
+            let err = load_service_cwt(Some("/nonexistent/arks-service.cwt".to_string()))
+                .expect_err("unreadable file must fail startup");
+            assert!(err.contains("ARKS_SERVICE_CWT_PATH"), "{err}");
+            assert!(err.contains("unreadable"), "{err}");
+        }
+
+        #[test]
+        fn readable_path_is_returned_trimmed() {
+            let dir = std::env::temp_dir().join(format!("arks-cwt-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("service.cwt");
+            std::fs::write(&path, "  d2845820abc\n").unwrap();
+            let token = load_service_cwt(Some(path.to_string_lossy().into_owned())).unwrap();
+            assert_eq!(token.trim(), "d2845820abc");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Route-level tests for the CWT gate on `/ws`.
+    ///
+    /// `/ws` is the NanoTDF KAS (0x03 rewrap) and is a gated route, so the
+    /// spec §1 `act` rule has to apply to it: an `X-Actor-Token` whose `sub`
+    /// is not in the bearer's `act[]` must 401. Before `/ws` was mounted
+    /// behind `require_cwt` the handler validated only the bearer and ignored
+    /// the actor header entirely, so such a request was upgraded.
+    ///
+    /// The 401 comes from the middleware before the handler runs, so the
+    /// state below is never dereferenced: its Redis/NATS/S3 clients are
+    /// lazily-constructed handles that open no connection.
+    mod ws_gate {
+        use super::*;
+        use crate::modules::cwt_token::{test_support, CwtValidator};
+        use tokio::net::TcpListener;
+
+        fn test_ws_state() -> Arc<WebSocketState> {
+            let settings = ServerSettings {
+                port: 0,
+                tls_enabled: false,
+                tls_cert_path: String::new(),
+                tls_key_path: String::new(),
+                kas_key_path: String::new(),
+                enable_timing_logs: false,
+                nats_url: "nats://127.0.0.1:4222".to_string(),
+                nats_subject: "test.subject".to_string(),
+                redis_url: "redis://127.0.0.1:6379".to_string(),
+                s3_bucket: "test-bucket".to_string(),
+                chain_rpc_url: None,
+                cwt_keys_url: String::new(),
+                cwt_expected_issuer: "https://identity.test".to_string(),
+                cwt_expected_audience: "https://arks.test".to_string(),
+            };
+            let aws = aws_config::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .build();
+            Arc::new(WebSocketState {
+                server_state: Arc::new(ServerState {
+                    settings,
+                    redis_client: RedisClient::open("redis://127.0.0.1:6379").unwrap(),
+                    s3_client: s3::Client::new(&aws),
+                    chain_validator: None,
+                }),
+                nats_connection: Arc::new(NatsConnection::new("nats://127.0.0.1:4222".to_string())),
+                apple_app_site_association: Arc::new(RwLock::new(String::new())),
+            })
+        }
+
+        async fn spawn() -> (String, test_support::Signer, wiremock::MockServer) {
+            let (signer, set) = test_support::keypair_and_set();
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/.well-known/cose-keys"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_raw(set, "application/cbor"),
+                )
+                .mount(&mock)
+                .await;
+            let auth = Arc::new(cwt_auth::CwtAuthState {
+                validator: Arc::new(CwtValidator::new(
+                    format!("{}/.well-known/cose-keys", mock.uri()),
+                    "https://identity.test".into(),
+                    "https://arks.test".into(),
+                )),
+            });
+            let app = ws_router(test_ws_state(), auth);
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+            (format!("http://{addr}"), signer, mock)
+        }
+
+        /// The fix that matters: an actor token that is itself valid but is
+        /// not listed in the bearer's `act[]` must be rejected on `/ws`, not
+        /// silently ignored.
+        #[tokio::test]
+        async fn actor_token_not_in_act_is_401() {
+            let (base, signer, _mock) = spawn().await;
+            let bearer = signer.mint_with_act(
+                &[
+                    ("iss", "https://identity.test"),
+                    ("sub", "did:key:z6Mka"),
+                    ("aud", "https://arks.test"),
+                ],
+                &["https://authorized-relay.test"],
+            );
+            let actor = signer.mint(&[
+                ("iss", "https://identity.test"),
+                ("sub", "https://rogue-relay.test"),
+                ("aud", "https://arks.test"),
+            ]);
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth(&bearer)
+                .header("X-Actor-Token", &actor)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(
+                r.text().await.unwrap(),
+                "Actor not authorized for this token"
+            );
+        }
+
+        /// An actor listed in the bearer's `act[]` gets past the gate. It
+        /// then fails the WebSocket upgrade (plain GET, no upgrade headers),
+        /// which is the proof it reached the handler rather than the gate.
+        #[tokio::test]
+        async fn authorized_actor_passes_the_gate() {
+            let (base, signer, _mock) = spawn().await;
+            let bearer = signer.mint_with_act(
+                &[
+                    ("iss", "https://identity.test"),
+                    ("sub", "did:key:z6Mka"),
+                    ("aud", "https://arks.test"),
+                ],
+                &["https://authorized-relay.test"],
+            );
+            let actor = signer.mint(&[
+                ("iss", "https://identity.test"),
+                ("sub", "https://authorized-relay.test"),
+                ("aud", "https://arks.test"),
+            ]);
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth(&bearer)
+                .header("X-Actor-Token", &actor)
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(r.status(), 401, "authorized actor must not be rejected");
+        }
+
+        #[tokio::test]
+        async fn missing_bearer_is_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::get(format!("{base}/ws")).await.unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(r.text().await.unwrap(), "Missing Bearer CWT");
+        }
+
+        #[tokio::test]
+        async fn invalid_bearer_is_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::Client::new()
+                .get(format!("{base}/ws"))
+                .bearer_auth("not-a-cwt")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 401);
+            assert_eq!(r.text().await.unwrap(), "Invalid CWT");
+        }
+
+        /// `route_layer`, not `layer`: the gate must not swallow the 404 for
+        /// an unmatched path when this router is merged into the app.
+        #[tokio::test]
+        async fn unmatched_path_is_404_not_401() {
+            let (base, _signer, _mock) = spawn().await;
+            let r = reqwest::get(format!("{base}/nope")).await.unwrap();
+            assert_eq!(r.status(), 404);
+        }
+    }
+
+    /// The KAS EC secret must never reach a log line: `KasKeys` derives
+    /// `Debug`, so the redaction has to come from `SecureEcPrivateKey` itself.
+    #[test]
+    fn kas_keys_debug_is_redacted() {
+        let secret = [0x42u8; 32];
+        let keys = KasKeys {
+            public_key: vec![0x02, 0x03, 0x04],
+            private_key: SecureEcPrivateKey::from_bytes(&secret).unwrap(),
+        };
+
+        let debug = format!("{:?}", keys);
+        assert!(debug.contains("REDACTED"), "not redacted: {debug}");
+        // 0x42 renders as `66` in a `Vec<u8>` Debug; a leaked secret would show
+        // 32 of them in a row.
+        assert!(!debug.contains("66, 66, 66, 66"), "secret leaked: {debug}");
+        assert!(
+            !debug.contains(&hex::encode(secret)),
+            "secret leaked: {debug}"
+        );
+    }
 
     #[tokio::test]
     async fn test_ephemeral_key_pair_and_custom_ecdh() {
@@ -3122,12 +3120,12 @@ mod tests {
     #[test]
     fn test_ecdh_known_values() -> Result<(), Box<dyn Error>> {
         // These are example values and should be replaced with actual test vectors
-        // kas_private_key_bytes
+        // KAS private key
         let server_private = "472c179ab235274ecb6678bcc5aa0a8578fc59b7431dd8dd37adbeb60c637618";
         let server_public = "03689f8463a91340e347847414f5ef67a6013ab7236b2229c70b717974ee74eb6c";
         // tdf_ephemeral_key
         let client_public = "02c8eee0d2c24780cbc29169739acc68904bdee3c0553d5ec1183ba476942de686";
-        // kas_private_key_bytes
+        // KAS private key
         let private_key_bytes = hex::decode(server_private).unwrap();
         // tdf_ephemeral_public_key
         let public_key_bytes = hex::decode(client_public).unwrap();
@@ -3137,27 +3135,13 @@ mod tests {
             "d5da0342ae4458cece9b3eb2d253c6212e9612ab9f8c9a4249ee4c9c59ccda13";
 
         let client_public_key = PublicKey::from_sec1_bytes(&public_key_bytes).unwrap();
-        let kas_private_key_option: Option<[u8; 32]> = private_key_bytes.clone().try_into().ok();
-        let kas_private_key_array = match kas_private_key_option {
-            Some(array) => array,
-            None => {
-                return Err(Box::new(std::io::Error::other(
-                    "Could not convert to array.",
-                )))
-            }
-        };
-        let server_secret_key = SecretKey::from_bytes(&kas_private_key_array.into())
-            .map_err(|_| "Invalid private key")
-            .ok();
-        let server_secret_key = server_secret_key.unwrap();
+        let server_key = SecureEcPrivateKey::from_bytes(&private_key_bytes)?;
 
-        let server_public_key = server_secret_key.public_key();
-        let compressed_public_key = server_public_key.to_encoded_point(true);
-        let compressed_public_key_bytes = compressed_public_key.as_bytes();
-        // println!("KAS Public Key Hex: {}", hex::encode(compressed_public_key_bytes));
-        assert_eq!(hex::encode(compressed_public_key_bytes), server_public);
+        // `SecureEcPrivateKey::public_key()` is the compressed SEC1 form the
+        // WebSocket `KasPublicKey` message has always advertised.
+        assert_eq!(hex::encode(server_key.public_key()?), server_public);
 
-        let result = custom_ecdh(&server_secret_key, &client_public_key).unwrap();
+        let result = server_key.perform_ecdh(&client_public_key)?;
         assert_eq!(hex::encode(result), expected_shared_secret);
         Ok(())
     }

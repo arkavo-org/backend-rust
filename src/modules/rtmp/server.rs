@@ -10,6 +10,7 @@ use super::registry::StreamRegistry;
 use super::session::RtmpSession;
 use super::stream_events::StreamEventBroadcaster;
 use super::DEFAULT_RTMP_PORT;
+use crate::modules::secure_keys::SecureEcPrivateKey;
 
 /// RTMP server configuration and state
 pub struct RtmpServer {
@@ -17,8 +18,8 @@ pub struct RtmpServer {
     pub port: u16,
     /// Redis client for manifest caching
     pub redis_client: Arc<redis::Client>,
-    /// KAS EC private key (32 bytes)
-    pub kas_private_key: [u8; 32],
+    /// KAS EC private key, held in the zeroizing wrapper
+    pub kas_private_key: SecureEcPrivateKey,
     /// Stream event broadcaster for NATS
     pub event_broadcaster: Option<Arc<StreamEventBroadcaster>>,
     /// Stream registry for publisher-subscriber linking
@@ -45,7 +46,7 @@ impl std::error::Error for ServerError {}
 
 impl RtmpServer {
     /// Create a new RTMP server with default configuration
-    pub fn new(redis_client: Arc<redis::Client>, kas_private_key: [u8; 32]) -> Self {
+    pub fn new(redis_client: Arc<redis::Client>, kas_private_key: SecureEcPrivateKey) -> Self {
         RtmpServer {
             port: DEFAULT_RTMP_PORT,
             redis_client,
@@ -59,7 +60,7 @@ impl RtmpServer {
     pub fn with_port(
         port: u16,
         redis_client: Arc<redis::Client>,
-        kas_private_key: [u8; 32],
+        kas_private_key: SecureEcPrivateKey,
     ) -> Self {
         RtmpServer {
             port,
@@ -74,7 +75,7 @@ impl RtmpServer {
     pub fn with_broadcaster(
         port: u16,
         redis_client: Arc<redis::Client>,
-        kas_private_key: [u8; 32],
+        kas_private_key: SecureEcPrivateKey,
         event_broadcaster: Arc<StreamEventBroadcaster>,
     ) -> Self {
         RtmpServer {
@@ -116,7 +117,7 @@ impl RtmpServer {
 
                     // Clone shared state for this connection
                     let redis = redis_client.clone();
-                    let kas_key = kas_private_key;
+                    let kas_key = kas_private_key.clone();
                     let broadcaster = event_broadcaster.clone();
                     let registry = stream_registry.clone();
 
@@ -165,7 +166,7 @@ impl RtmpServer {
                             log::debug!("Accepted RTMP connection from {}", addr);
 
                             let redis = redis_client.clone();
-                            let kas_key = kas_private_key;
+                            let kas_key = kas_private_key.clone();
                             let broadcaster = event_broadcaster.clone();
                             let registry = stream_registry.clone();
 
@@ -198,7 +199,6 @@ mod tests {
 
     #[test]
     fn test_server_default_port() {
-        let kas_key = [0u8; 32];
         // We can't actually create a redis client in unit tests
         // but we can test the port logic
         assert_eq!(DEFAULT_RTMP_PORT, 1935);

@@ -32,6 +32,12 @@ jobs:
           components: clippy, rustfmt
       - name: test
         run: cargo test --verbose
+      - name: test (c2pa_signing)
+        # c2pa_signing is off by default, so the plain `test` step above never
+        # compiles the CWT-gate regression tests on /c2pa/v1/sign and
+        # /c2pa/v1/validate (an ungated sign route is a signing oracle).
+        # Run them explicitly so CI actually exercises that guard.
+        run: cargo test --lib --bin arks --features c2pa_signing
       - name: lint
         # Exclude fairplay feature: requires Apple SDK binaries not in repository
         # Only lint arkavo-rs package: excludes fpssdk (Apple copyrighted vendor code)

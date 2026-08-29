@@ -343,7 +343,11 @@ Analytics events published to NATS (`media.metrics.*`):
 
 ### Network Security
 - Use TLS for all API endpoints
-- Validate JWT tokens for production (set `OAUTH_PUBLIC_KEY_PATH`)
+- Every media endpoint except `GET /media/v1/certificate` requires an
+  `Authorization: Bearer <CWT>`; there is no way to disable the check. Point
+  `CWT_KEYS_URL`, `CWT_EXPECTED_ISSUER` and `CWT_EXPECTED_AUDIENCE` at your
+  production identity service so tokens are verified against the right keys,
+  issuer and audience
 - Implement rate limiting on key request endpoints
 - Monitor for anomalous request patterns
 
