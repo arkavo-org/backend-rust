@@ -1064,10 +1064,7 @@ pub async fn session_start(
     // is accepted only when it agrees with the authenticated subject.
     if let Some(claimed) = payload.user_id.as_deref() {
         if claimed != subject.sub {
-            warn!(
-                "session/start user_id {} does not match authenticated subject {}",
-                claimed, subject.sub
-            );
+            warn!("session/start user_id does not match authenticated subject");
             return Err(ErrorResponse {
                 error: "authentication_failed".to_string(),
                 message: "user_id does not match the authenticated subject".to_string(),
